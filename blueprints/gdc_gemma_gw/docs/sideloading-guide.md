@@ -222,7 +222,7 @@ This section provides the absolute, step-by-step deployment instructions for new
 > **GDC Managed Harbor & Cluster Trust Setup:**
 > - **Provision Managed Harbor:** Create a project-scoped Harbor instance via `gdcloud harbor instances create ${HARBOR_INSTANCE} --project=${PROJECT}` and `gdcloud harbor harbor-projects create ${HARBOR_PROJECT} --project=${PROJECT} --instance=${HARBOR_INSTANCE}` (or declaratively via `charts/gdc-harbors`).
 > - **Robot Account & Pull Secret:** Create a Harbor Robot Account, run `docker login -u "${HARBOR_USER}" -p "${HARBOR_SECRET}" "${REGISTRY}"`, and create the Kubernetes pull secret (`kubectl create secret docker-registry ${HARBOR_INSTANCE}-creds --from-file=.dockerconfigjson=${HOME}/.docker/config.json -n gemma-inference`).
-> - **Standard Cluster TLS Trust:** If deploying to a Standard Cluster, ensure the `registryMirrors` section of the `Cluster` resource includes a `caCertSecretRef` (`trust-store-root-ext` in `anthos-creds`) entry for your Managed Harbor endpoint. (See [`tools/mirror-images/README.md`](../../../tools/mirror-images/README.md) in `gdc-iac-org` for complete details.)
+> - **Standard Cluster TLS Trust:** If deploying to a Standard Cluster, ensure the `registryMirrors` section of the `Cluster` resource includes a `caCertSecretRef` (`trust-store-root-ext` in `anthos-creds`) entry for your Managed Harbor endpoint. (See `tools/mirror-images/README.md` in `gdc-iac-org` for complete details.)
 
 1. Move the generated `packages/gemma-gateway-gdc/` staging folders into your offline rack workstations.
 2. Extract the container image targets:
@@ -272,10 +272,13 @@ tar -xzf gateway/ollama/gemma-gateway-gdc-manifests.tar.gz
 ```
 
 #### Pathway B: Launching vLLM (GDC Production Dual-Model serving):
-Extract the manifests bundle, initialize the namespace, and deploy the dual serving blueprints concurrently. We enforce GDC SAN dynamic persistent volumes (`standard-rwx`) by passing the GDC-specific overrides file `-f blueprints/vllm-gke/values-gdc.yaml`:
+Extract the manifests bundle, initialize the namespace, and deploy the dual serving blueprints concurrently. We enforce GDC SAN dynamic persistent volumes (`standard-rwx`), local model paths (`/models/gemma-4-*`), 8192 context length, and bare-metal GPU node pool selectors (`cloud.google.com/gke-accelerator: null`) by passing `-f blueprints/vllm-gke/values-gdc.yaml` (see [Section 3.3 of the vLLM Serving Guide](vllm-serving-guide.md#33-pre-deployment-production-adaptations--deploying-via-helm) for the complete pre-deployment production checklist):
 
 ```bash
 tar -xzf gateway/vllm/gemma-gateway-gdc-manifests.tar.gz
+
+export REGISTRY_HOST="harbor.gdc.local/gemma-repo" # Map to your local GDC Managed Harbor registry
+export TAG="v1.0.0"
 
 # 1. Create target namespace
 kubectl apply -f standalone/manifests/00-namespace.yaml
@@ -283,20 +286,31 @@ kubectl apply -f standalone/manifests/00-namespace.yaml
 # 2. Deploy GDC Production Release A (26B MoE - Latency Optimized)
 helm upgrade --install vllm-26b ./blueprints/vllm-gke -n gemma-inference \
   -f ./blueprints/vllm-gke/values-gdc.yaml \
+  --set image.repository="${REGISTRY_HOST}/vllm-openai" \
+  --set image.tag="${TAG}" \
+  --set persistence.existingClaim="vllm-26b-weights-pvc" \
   --set model.name="/models/gemma-4-26B-A4B-it-weights" \
   --set model.servedModelName="gemma4:26b" \
-  --set resources.limits."nvidia.com/gpu"=1
+  --set model.maxModelLen=8192 \
+  --set model.tensorParallelSize=1 \
+  --set resources.limits.gpu=1 \
+  --set nodeSelector.pool="gpu-moe"
 
 # 3. Deploy GDC Production Release B (31B Dense - Reasoning Optimized)
 helm upgrade --install vllm-31b ./blueprints/vllm-gke -n gemma-inference \
   -f ./blueprints/vllm-gke/values-gdc.yaml \
+  --set image.repository="${REGISTRY_HOST}/vllm-openai" \
+  --set image.tag="${TAG}" \
+  --set persistence.existingClaim="vllm-31b-weights-pvc" \
   --set model.name="/models/gemma-4-31B-it-weights" \
   --set model.servedModelName="gemma4:31b" \
-  --set resources.limits."nvidia.com/gpu"=2
+  --set model.maxModelLen=8192 \
+  --set model.tensorParallelSize=2 \
+  --set resources.limits.gpu=2 \
+  --set nodeSelector.pool="gpu-dense"
 
 # 4. Deploy the corresponding production vLLM gateway proxy manifest
 export INFERENCE_ENGINE="vllm"
-export REGISTRY_HOST="harbor.gdc.local/library" # Map to your local Harbor registry
 ./standalone/install-all.sh
 ```
 

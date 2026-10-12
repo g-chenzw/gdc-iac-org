@@ -279,53 +279,66 @@ You should see **three pods** (`ollama-26b-*`, `ollama-31b-*`, and `gemma-gatewa
 #### Pathway 2: Deploying the high-performance vLLM serving engines (Production Mirror / Phase 8)
 Administrators can select between two pathways depending on GKE cluster rig GPU resources:
 
-##### Option A: Full-Scale Simultaneous Dual-Model serving (Requires GKE GPU Pool Scale-Up)
+##### Option A: Full-Scale Simultaneous Dual-Model Serving (Requires Multi-GPU A100/H100 or Sideloaded Weights)
+
+If you have already downloaded `gemma-4-26B-A4B-it-weights.tar.gz` and `gemma-4-31B-it-weights.tar.gz` from Hugging Face onto your Cloud Workstation, see **[vLLM Serving Guide — Section 3.2](vllm-serving-guide.md#32-bootstrapping-storage--extracting-weights-inside-gdc-ag)** (or **Step 5.1 Option A2** below) to sideload those archives directly into GKE `standard-rwo` PersistentVolumeClaims without re-downloading from Hugging Face.
+
+> [!WARNING]
+> **VRAM Hardware Constraint on `g2-standard-24` (2x 24GB L4 GPUs):**  
+> Unquantized BF16 `gemma-4-26B-A4B-it` (~52 GB) and `gemma-4-31B-it` (~64 GB) exceed the 24 GB VRAM limit of a single NVIDIA L4 GPU per pod in vLLM (even with FP8 quantization at ~26 GB / ~32 GB). On a 2x L4 GKE sandbox cluster, use **Option B (`google/gemma-2b-it` with `persistence.enabled=false`)** to validate the vLLM inference gateway and routing swap, and use **Pathway 1 (Baked Ollama 4-bit GGUF `ollama-26b` & `ollama-31b`)** to run the full 26B and 31B models side-by-side.
+
 ```bash
 # 1. Deploy the 26B MoE serving release
 helm upgrade --install vllm-26b ./blueprints/vllm-gke -n gemma-inference \
-  --set model.name="google/gemma-4-26b-it" \
+  --set model.name="google/gemma-4-26B-A4B-it" \
   --set persistence.enabled=true \
   --set persistence.storageClassName="standard-rwo" \
   --set persistence.accessModes={ReadWriteOnce} \
-  --set persistence.size="100Gi" \
+  --set persistence.size="120Gi" \
   --set model.quantization="fp8" \
   --set model.servedModelName="gemma4:26b" \
-  --set resources.limits."nvidia.com/gpu"=1
+  --set resources.limits.gpu=1
 
 # 2. Deploy the 31B Dense serving release
 helm upgrade --install vllm-31b ./blueprints/vllm-gke -n gemma-inference \
-  --set model.name="google/gemma-4-31b-it" \
+  --set model.name="google/gemma-4-31B-it" \
   --set persistence.enabled=true \
   --set persistence.storageClassName="standard-rwo" \
   --set persistence.accessModes={ReadWriteOnce} \
   --set persistence.size="120Gi" \
   --set model.quantization="fp8" \
   --set model.servedModelName="gemma4:31b" \
-  --set resources.limits."nvidia.com/gpu"=1 # Scale to 2 if running unquantized
+  --set resources.limits.gpu=2
 ```
 
-##### Option B: Testing Mock Fallbacks (Recommended for standard single-GPU sandbox staging)
-We deploy two separate releases of the chart using a lightweight 2B model as a drop-in substitute. This preserves all proxy routing and parameter evaluations without causing GKE OOM crashes:
+##### Option B: Testing Mock Fallbacks (Recommended for 2x L4 GKE Sandbox Gateway Validation)
+We deploy two separate releases of the chart (`vllm-26b` and `vllm-31b`) using the lightweight `google/gemma-2b-it` model with `persistence.enabled=false`. This skips provisioning 300Gi of PVCs, boots in ~45–60 seconds on 2x L4 GPUs, and validates all `gemma-gateway` vLLM routing and parameter evaluations without GKE OOM crashes:
 
 ```bash
-# 1. Deploy the 26B MoE Mock Release (using Gemma 2B)
+# 1. Deploy the 26B MoE Mock Release (advertises servedModelName="gemma4:26b" on GPU #1)
 helm upgrade --install vllm-26b ./blueprints/vllm-gke -n gemma-inference \
   --set model.name="google/gemma-2b-it" \
   --set model.servedModelName="gemma4:26b" \
-  --set resources.limits."nvidia.com/gpu"=1
+  --set persistence.enabled=false \
+  --set resources.limits.gpu=1
 
-# 2. Deploy the 31B Dense Mock Release (using Gemma 2B)
+# 2. Deploy the 31B Dense Mock Release (advertises servedModelName="gemma4:31b" on GPU #2)
 helm upgrade --install vllm-31b ./blueprints/vllm-gke -n gemma-inference \
   --set model.name="google/gemma-2b-it" \
   --set model.servedModelName="gemma4:31b" \
-  --set resources.limits."nvidia.com/gpu"=1
+  --set persistence.enabled=false \
+  --set resources.limits.gpu=1
 ```
 
 ##### Configure Manifest Placeholders & Deploy Gateway Proxy Manifest
 Run the configuration script from the repository root to point the manifests to your newly built container images in your Workstation Artifact Registry before deploying:
 
 ```bash
-./configure-blueprints.sh -p ${PROJECT_ID} -n ${NAMESPACE} -r ${REGISTRY_HOST} -d gateway
+export PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
+export REGION="${REGION:-us-west4}"
+export AR_REGION="${REPO_REGION:-$REGION}"
+export REGISTRY_HOST="${REGISTRY_HOST:-${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/gemma-repo}"
+./configure-blueprints.sh -p "${PROJECT_ID}" -n "${NAMESPACE}" -r "${REGISTRY_HOST}" -d gateway
 export INFERENCE_ENGINE="vllm"
 ./standalone/install-all.sh
 ```
@@ -747,58 +760,161 @@ gcloud container clusters delete $CLUSTER_NAME --zone $ZONE --project $PROJECT_I
 This section provides a comprehensive guide for platform administrators and testing teams to handle cluster resource boundaries, online emulations, and GDC-air-gapped operations smoothly.
 
 ### 5.1. Swapping Serving Engines (Ollama vs. vLLM) in Sandboxed Clusters
-Because the cluster does not possess enough GPU hardware cores to host both serving backends concurrently under sandboxed constraints, you must execute a clean resource release cycle during framework handovers:
+Because a 2x L4 GKE sandbox cluster (`gdc-gemma-cluster`) only has 2 GPU cores (`2x nvidia-l4`), it cannot host both the two Ollama pods (`ollama-26b`, `ollama-31b`) and the two vLLM pods (`vllm-26b`, `vllm-31b`) simultaneously. Execute a clean resource release cycle during framework handovers:
+
+#### A. Swapping FROM Ollama TO vLLM (Path A $\rightarrow$ Path B)
+
+##### Option A1: Fast vLLM Inference Gateway Swap Test (`google/gemma-2b-it`, `persistence.enabled=false`)
+Recommended on 2x L4 (24GB VRAM) GKE clusters to validate `gemma-gateway` vLLM routing (`vllm-26b-vllm-gke-service:8000` and `vllm-31b-vllm-gke-service:8000`) in ~45–60 seconds without creating 300Gi of PVCs:
 
 ```bash
-# A. Swapping FROM Ollama TO vLLM (Path A to B)
-# 1. Scale Ollama runtimes to zero and wipe the old pods
-kubectl scale deployment ollama-26b -n gemma-inference --replicas=0
-kubectl scale deployment ollama-31b -n gemma-inference --replicas=0
-kubectl delete pod -n gemma-inference -l app.kubernetes.io/name=ollama --grace-period=0 --force
+# 1. Ensure HF token secret exists & scale Ollama runtimes to zero to release both L4 GPUs
+export NAMESPACE="${NAMESPACE:-gemma-inference}"
+export PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
+export REGION="${REGION:-us-west4}"
+export AR_REGION="${REPO_REGION:-$REGION}"
+export REGISTRY_HOST="${REGISTRY_HOST:-${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/gemma-repo}"
 
-# 2. Deploy the vLLM blueprints with your overrides
-helm upgrade --install vllm-serving ./blueprints/vllm-gke -n gemma-inference \
-  --set model.name="google/gemma-4-E4B-it" \
-  --set persistence.enabled=true \
-  --set persistence.storageClassName="standard-rwo" \
-  --set persistence.accessModes={ReadWriteOnce} \
-  --set persistence.size="100Gi" \
-  --set model.quantization="fp8" \
-  --set model.servedModelName="gemma4:26b"
+kubectl scale deployment ollama-26b ollama-31b -n "${NAMESPACE}" --replicas=0
+kubectl delete pod -n "${NAMESPACE}" -l app.kubernetes.io/name=ollama --grace-period=0 --force --ignore-not-found
 
-# 3. Redeploy the pure, isolated production vLLM gateway proxy manifest
+# 2. Deploy BOTH vLLM releases (vllm-26b on GPU #1 and vllm-31b on GPU #2)
+helm upgrade --install vllm-26b ./blueprints/vllm-gke -n "${NAMESPACE}" \
+  --set model.name="google/gemma-2b-it" \
+  --set model.servedModelName="gemma4:26b" \
+  --set persistence.enabled=false \
+  --set resources.limits.gpu=1
+
+helm upgrade --install vllm-31b ./blueprints/vllm-gke -n "${NAMESPACE}" \
+  --set model.name="google/gemma-2b-it" \
+  --set model.servedModelName="gemma4:31b" \
+  --set persistence.enabled=false \
+  --set resources.limits.gpu=1
+
+# 3. Hydrate and apply the vLLM gateway proxy manifest
+./configure-blueprints.sh -p "${PROJECT_ID}" -n "${NAMESPACE}" -r "${REGISTRY_HOST}" -d gateway
 export INFERENCE_ENGINE="vllm"
 ./standalone/install-all.sh
 
-# 4. Force rollout restart to point the proxy back at the new vLLM service pool
-kubectl rollout restart deployment/gemma-gateway -n gemma-inference
+# 4. Wait for vLLM pods and restart gateway proxy
+kubectl rollout status deployment/vllm-26b-vllm-gke -n "${NAMESPACE}" --timeout=180s
+kubectl rollout status deployment/vllm-31b-vllm-gke -n "${NAMESPACE}" --timeout=180s
+kubectl rollout restart deployment/gemma-gateway -n "${NAMESPACE}"
+kubectl rollout status deployment/gemma-gateway -n "${NAMESPACE}" --timeout=90s
 ```
+
+##### Option A2: Sideloading Pre-Downloaded `gemma-4-26B-A4B-it-weights.tar.gz` & `gemma-4-31B-it-weights.tar.gz` from Cloud Workstation
+If you already have `gemma-4-26B-A4B-it-weights.tar.gz` and `gemma-4-31B-it-weights.tar.gz` downloaded from Hugging Face on your Cloud Workstation and want to test the offline PVC sideloading pipeline (note: loading full 26B/31B weights into vLLM requires multi-GPU A100/H100 node pools as single 24GB L4 GPUs will OOM on unquantized 52GB/64GB weights):
+
 ```bash
-# B. Swapping FROM vLLM TO Ollama (Path B to A)
-# 1. Completely uninstall active vLLM Helm releases to release GPU locks
-helm uninstall vllm-26b vllm-31b vllm-serving -n gemma-inference --ignore-not-found
+# 1. Scale down Ollama deployments to free GPUs
+kubectl scale deployment ollama-26b ollama-31b -n "${NAMESPACE}" --replicas=0
+kubectl delete pod -n "${NAMESPACE}" -l app.kubernetes.io/name=ollama --grace-period=0 --force --ignore-not-found
 
-# 2. Forcibly purge lingering vLLM pods to trigger immediate hardware teardowns
-kubectl delete pod -n gemma-inference -l app.kubernetes.io/name=vllm-gke --grace-period=0 --force --ignore-not-found
+# 2. Provision GKE standard-rwo PVCs and temporary staging helper pod
+cat << 'EOF' | kubectl apply -n "${NAMESPACE}" -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-26b-weights-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: "standard-rwo"
+  resources:
+    requests:
+      storage: 120Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-31b-weights-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: "standard-rwo"
+  resources:
+    requests:
+      storage: 120Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-staging-helper
+spec:
+  volumes:
+    - name: storage-26b
+      persistentVolumeClaim:
+        claimName: vllm-26b-weights-pvc
+    - name: storage-31b
+      persistentVolumeClaim:
+        claimName: vllm-31b-weights-pvc
+  containers:
+    - name: staging-helper
+      image: debian:bookworm-slim
+      command: ["/bin/sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - name: storage-26b
+          mountPath: /mnt/vllm-26b
+        - name: storage-31b
+          mountPath: /mnt/vllm-31b
+EOF
 
-# 2a. Safeguard (Optional): If PVC finalizers lock up blocking clean reinstalls
-# (As documented in Blocker 6, patch the finalizers to release volume protections):
-kubectl patch pvc vllm-26b-vllm-gke-weights -n gemma-inference -p '{"metadata":{"finalizers":null}}' --type=merge || true
-kubectl patch pvc vllm-31b-vllm-gke-weights -n gemma-inference -p '{"metadata":{"finalizers":null}}' --type=merge || true
+kubectl wait --for=condition=Ready pod/vllm-staging-helper -n "${NAMESPACE}" --timeout=180s
 
-# 3. Export environment context to direct image hydration tags
-export PROJECT_ID=$(gcloud config get-value project)
-export REGION="us-west4" # Replace with your active region (e.g. us-west4 or us-central1)
-export REGISTRY_HOST="${REGION}-docker.pkg.dev/${PROJECT_ID}/gemma-repo"
+# 3. Copy and extract the pre-downloaded tarballs from Cloud Workstation into the PVCs
+kubectl cp gemma-4-26B-A4B-it-weights.tar.gz "${NAMESPACE}/vllm-staging-helper:/mnt/vllm-26b/"
+kubectl cp gemma-4-31B-it-weights.tar.gz "${NAMESPACE}/vllm-staging-helper:/mnt/vllm-31b/"
+kubectl exec vllm-staging-helper -n "${NAMESPACE}" -- /bin/sh -c \
+  "tar -xzf /mnt/vllm-26b/gemma-4-26B-A4B-it-weights.tar.gz -C /mnt/vllm-26b/ && rm /mnt/vllm-26b/gemma-4-26B-A4B-it-weights.tar.gz"
+kubectl exec vllm-staging-helper -n "${NAMESPACE}" -- /bin/sh -c \
+  "tar -xzf /mnt/vllm-31b/gemma-4-31B-it-weights.tar.gz -C /mnt/vllm-31b/ && rm /mnt/vllm-31b/gemma-4-31B-it-weights.tar.gz"
+kubectl delete pod vllm-staging-helper -n "${NAMESPACE}"
+
+# 4. Deploy vllm-26b and vllm-31b pointing to the pre-populated PVCs
+helm upgrade --install vllm-26b ./blueprints/vllm-gke -n "${NAMESPACE}" \
+  --set persistence.existingClaim="vllm-26b-weights-pvc" \
+  --set model.name="/models/gemma-4-26B-A4B-it-weights" \
+  --set model.servedModelName="gemma4:26b" \
+  --set model.quantization="fp8"
+
+helm upgrade --install vllm-31b ./blueprints/vllm-gke -n "${NAMESPACE}" \
+  --set persistence.existingClaim="vllm-31b-weights-pvc" \
+  --set model.name="/models/gemma-4-31B-it-weights" \
+  --set model.servedModelName="gemma4:31b" \
+  --set model.quantization="fp8"
+```
+
+#### B. Swapping FROM vLLM TO Ollama — Restoring Actual 26B & 31B Models (Path B $\rightarrow$ Path A)
+
+```bash
+# 1. Uninstall active vLLM Helm releases and purge lingering vLLM pods to release both L4 GPUs
+export NAMESPACE="${NAMESPACE:-gemma-inference}"
+helm uninstall vllm-26b vllm-31b -n "${NAMESPACE}" 2>/dev/null || true
+helm uninstall vllm-serving -n "${NAMESPACE}" 2>/dev/null || true
+kubectl delete pod -n "${NAMESPACE}" -l app.kubernetes.io/name=vllm-gke --grace-period=0 --force --ignore-not-found
+
+# 2. Safeguard (Optional): If vLLM PVCs were created and stuck in Terminating, clear finalizers
+kubectl patch pvc vllm-26b-vllm-gke-weights -n "${NAMESPACE}" -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+kubectl patch pvc vllm-31b-vllm-gke-weights -n "${NAMESPACE}" -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+
+# 3. Export environment context and restore both baked Ollama deployments (ollama-26b & ollama-31b) + Gateway Proxy
+export PROJECT_ID="${PROJECT_ID:-$(gcloud config get-value project)}"
+export REGION="${REGION:-us-west4}"
+export AR_REGION="${REPO_REGION:-$REGION}"
+export REGISTRY_HOST="${REGISTRY_HOST:-${AR_REGION}-docker.pkg.dev/${PROJECT_ID}/gemma-repo}"
 export INFERENCE_ENGINE="ollama"
-export OLLAMA_MODEL_VARIANT="26b" # "26b" MoE or "31b" Dense
+export OLLAMA_MODEL_VARIANT="26b" # Sets initial default variant; BOTH ollama-26b and ollama-31b run side-by-side
 
-# 4. Bootstrap and run installer (hydrates image tags dynamically on execution!)
 chmod +x standalone/install-all.sh
 ./standalone/install-all.sh
 
-# 5. Verify rollout status of the gateway proxy
-kubectl rollout status deployment/gemma-gateway -n gemma-inference
+# 4. Ensure both ollama-26b and ollama-31b are scaled to 1 replica and wait for rollouts
+kubectl scale deployment ollama-26b ollama-31b -n "${NAMESPACE}" --replicas=1
+kubectl rollout status deployment/ollama-26b -n "${NAMESPACE}" --timeout=180s
+kubectl rollout status deployment/ollama-31b -n "${NAMESPACE}" --timeout=180s
+kubectl rollout status deployment/gemma-gateway -n "${NAMESPACE}" --timeout=90s
+
+# 5. Verify Gateway active_framework is "ollama" and both Ollama pods are 1/1 Running
+kubectl get pods -n "${NAMESPACE}"
 ```
 
 ---

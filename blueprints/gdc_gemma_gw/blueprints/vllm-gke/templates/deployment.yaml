@@ -33,6 +33,10 @@ spec:
             - "{{ .Values.model.gpuMemoryUtilization }}"
             - "--max-num-batched-tokens"
             - "4096"
+            {{- if .Values.model.tensorParallelSize }}
+            - "--tensor-parallel-size"
+            - "{{ .Values.model.tensorParallelSize }}"
+            {{- end }}
             {{- if .Values.model.quantization }}
             - "--quantization"
             - "{{ .Values.model.quantization }}"
@@ -62,7 +66,7 @@ spec:
           {{- end }}
           resources:
             limits:
-              nvidia.com/gpu: {{ .Values.resources.limits.gpu | default 1 }}
+              nvidia.com/gpu: {{ .Values.resources.limits.gpu | default (index .Values.resources.limits "nvidia.com/gpu") | default 1 }}
               memory: {{ .Values.resources.limits.memory }}
             requests:
               cpu: {{ .Values.resources.requests.cpu }}
