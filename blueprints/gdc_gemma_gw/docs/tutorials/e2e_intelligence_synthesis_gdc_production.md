@@ -306,16 +306,16 @@ You can deploy the inference tier using either **Method A (Direct Helm & Manifes
 
 ### Method A: Direct Helm & Manifest Deployment
 
-#### 1. Pre-Deployment Production Adaptations & vLLM Serving Pools Backed by GDC SAN (`standard-rwx`)
-When transitioning from the lightweight GCP testing configuration (`blueprints/vllm-gke/values.yaml`, which defaults to `google/gemma-2b-it`, `maxModelLen: 2048`, and `cloud.google.com/gke-accelerator: nvidia-l4`) to GDC-ag production, `blueprints/vllm-gke/values-gdc.yaml` and the Helm overrides below apply the mandatory production adaptations:
+#### 1. Pre-Deployment Production Adaptations & vLLM Serving Pools Backed by GDC SAN (`standard-rwx`) on NVIDIA H200 (141GB)
+When transitioning from the lightweight GCP testing configuration (`blueprints/vllm-gke/values.yaml`, which defaults to `google/gemma-2b-it`, `maxModelLen: 2048`, `memory: 48Gi`, and `cloud.google.com/gke-accelerator: nvidia-l4`) to GDC-ag production on **NVIDIA H200 GPUs (141 GB HBM3e VRAM)**, `blueprints/vllm-gke/values-gdc.yaml` and the Helm overrides below apply the mandatory production adaptations:
 * **`model.name` & `model.servedModelName`**: Switches from the 2B test mock (`google/gemma-2b-it`) to the offline Hugging Face snapshots staged on the GDC SAN PVC (`/models/gemma-4-26B-A4B-it-weights` and `/models/gemma-4-31B-it-weights`) and exposes them as `gemma4:26b` and `gemma4:31b` (required for accurate NL-to-SQL schema compliance and multi-doc RAG synthesis).
-* **`model.maxModelLen: 8192`**: Expands the context window from the 24GB L4 test cap (`2048`) to `8192` tokens on A100/H100 GPUs so RAG context and `Gemma 4` reasoning (`thinking`) blocks are not truncated.
-* **`model.tensorParallelSize` & `resources.limits.gpu`**: Passes `--tensor-parallel-size 2` alongside `resources.limits.gpu=2` when sharding `Gemma 4 31B` (~62 GB BF16) across 2 GPUs (preventing GPU 0 OOM).
-* **`nodeSelector` (`cloud.google.com/gke-accelerator: null`)**: Nulls out the GKE `nvidia-l4` selector inherited from `values.yaml` so pods schedule cleanly onto GDC-ag `pool=gpu-moe` and `pool=gpu-dense` nodes.
+* **`model.maxModelLen: 32768`**: Expands the context window from the 24GB L4 test cap (`2048`) to `32768` tokens on 141GB H200 GPUs so RAG context and `Gemma 4` reasoning (`thinking`) blocks are never truncated.
+* **Single-GPU H200 Fit (`model.tensorParallelSize: 1` & `resources.limits.gpu: 1`) + Host RAM (`96Gi` limit / `64Gi` request)**: Both `Gemma 4 26B` (~52 GB BF16) and `Gemma 4 31B` (~62 GB BF16) fit within a single 141GB H200 GPU with ~65–75 GB HBM3e remaining for KV cache, avoiding multi-GPU all-reduce overhead. Host memory limits are raised from `48Gi` to `96Gi` (`64Gi` request) to prevent cgroup `OOMKilled` terminations while loading 62 GB safetensors files from SAN storage.
+* **`nodeSelector` (`cloud.google.com/gke-accelerator: null`)**: Nulls out the GKE `nvidia-l4` selector inherited from `values.yaml` so pods schedule cleanly onto GDC-ag H200 `pool=gpu-moe` and `pool=gpu-dense` nodes.
 * **`persistence.storageClassName: "standard-rwx"`**: Enforces GDC SAN `ReadWriteMany` storage (`150Gi`).
 
 ```bash
-# 1. Deploy Gemma 4 26B A4B (MoE) on gpu-moe pool
+# 1. Deploy Gemma 4 26B A4B (MoE) on gpu-moe H200 pool (1x H200 141GB)
 helm upgrade --install vllm-26b ./blueprints/vllm-gke \
   --namespace "${NAMESPACE}" \
   -f ./blueprints/vllm-gke/values-gdc.yaml \
@@ -323,12 +323,12 @@ helm upgrade --install vllm-26b ./blueprints/vllm-gke \
   --set image.tag="${TAG}" \
   --set model.name="/models/gemma-4-26B-A4B-it-weights" \
   --set model.servedModelName="gemma4:26b" \
-  --set model.maxModelLen=8192 \
+  --set model.maxModelLen=32768 \
   --set model.tensorParallelSize=1 \
   --set resources.limits.gpu=1 \
   --set nodeSelector.pool="gpu-moe"
 
-# 2. Deploy Gemma 4 31B (Dense) on gpu-dense pool
+# 2. Deploy Gemma 4 31B (Dense) on gpu-dense H200 pool (1x H200 141GB)
 helm upgrade --install vllm-31b ./blueprints/vllm-gke \
   --namespace "${NAMESPACE}" \
   -f ./blueprints/vllm-gke/values-gdc.yaml \
@@ -336,9 +336,9 @@ helm upgrade --install vllm-31b ./blueprints/vllm-gke \
   --set image.tag="${TAG}" \
   --set model.name="/models/gemma-4-31B-it-weights" \
   --set model.servedModelName="gemma4:31b" \
-  --set model.maxModelLen=8192 \
-  --set model.tensorParallelSize=2 \
-  --set resources.limits.gpu=2 \
+  --set model.maxModelLen=32768 \
+  --set model.tensorParallelSize=1 \
+  --set resources.limits.gpu=1 \
   --set nodeSelector.pool="gpu-dense"
 ```
 

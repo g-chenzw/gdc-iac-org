@@ -337,17 +337,18 @@ Now, your dynamic PersistentVolumes are pre-loaded with model weights and mapped
 
 ---
 
-### 3.3. Pre-Deployment Production Adaptations & Deploying via Helm
+### 3.3. Pre-Deployment Production Adaptations & Deploying via Helm (NVIDIA H200 141GB)
 
-Before deploying the `vLLM` production configuration on a GDC air-gapped (`GDC-ag`) cluster, note the following adaptations required when transitioning from the lightweight GCP testing configuration (`google/gemma-2b-it` on 1x L4 GPU) to full `Gemma 4 26B` / `31B` weights on GDC-ag GPU node pools. These defaults are pre-configured in `blueprints/vllm-gke/values-gdc.yaml` and `blueprints/vllm-gke/templates/deployment.yaml`:
+Before deploying the `vLLM` production configuration on a GDC air-gapped (`GDC-ag`) cluster equipped with **NVIDIA H200 GPUs (141 GB HBM3e VRAM per GPU)**, note the following adaptations required when transitioning from the lightweight GCP testing configuration (`google/gemma-2b-it` on 1x 24GB L4 GPU) to full unquantized `Gemma 4 26B` (~52 GB BF16) and `Gemma 4 31B` (~62 GB BF16) weights. These defaults are pre-configured in `blueprints/vllm-gke/values-gdc.yaml` and `blueprints/vllm-gke/templates/deployment.yaml`:
 
-| Component / File | Setting / Parameter | GCP Testing Default (`values.yaml`) | GDC-ag Production Adaptation (`values-gdc.yaml` / `--set`) | Why It Must Change for Production |
+| Component / File | Setting / Parameter | GCP Testing Default (`values.yaml`) | GDC-ag H200 Production Adaptation (`values-gdc.yaml` / `--set`) | Why It Must Change for Production |
 | :--- | :--- | :--- | :--- | :--- |
 | `blueprints/vllm-gke/values-gdc.yaml` | `model.name` | `google/gemma-2b-it` | `/models/gemma-4-26B-A4B-it-weights` (26B)<br>`/models/gemma-4-31B-it-weights` (31B) | Points `vLLM` to the offline Hugging Face snapshots extracted onto the GDC SAN PVC (`/models`) instead of attempting an external HF download or running the 2B test mock. |
 | `blueprints/vllm-gke/values-gdc.yaml` | `model.servedModelName` | `""` (or `gemma4:26b` on 2B mock) | `gemma4:26b` (on `vllm-26b`)<br>`gemma4:31b` (on `vllm-31b`) | Registers the OpenAI model aliases expected by `gemma-gateway` (`MODEL_ROUTING_CONFIG`) and `gemma-client` (enabling accurate NL-to-SQL schema compliance and RAG synthesis). |
-| `blueprints/vllm-gke/values-gdc.yaml` | `model.maxModelLen` | `2048` (tuned for 24GB L4) | `8192` (or `16384` on 80GB A100/H100) | Prevents `400 Bad Request` context-length errors on multi-document RAG prompts and gives `Gemma 4` sufficient token headroom for internal reasoning (`thinking`) + output generation. |
-| `blueprints/vllm-gke/values-gdc.yaml` & `templates/deployment.yaml` | `model.tensorParallelSize` & `resources.limits.gpu` | `1` GPU, `tensorParallelSize: 1` | `resources.limits.gpu=2` **and** `model.tensorParallelSize=2` (for `31B` on 2x GPUs) | Allocating 2 GPUs in Kubernetes without passing `--tensor-parallel-size 2` to `vLLM` leaves GPU 1 idle and causes an immediate CUDA OOM on GPU 0 when loading 62 GB of `31B` BF16 weights. |
-| `blueprints/vllm-gke/values-gdc.yaml` | `nodeSelector` | `cloud.google.com/gke-accelerator: nvidia-l4` | `cloud.google.com/gke-accelerator: null`<br>`pool: gpu-moe` / `pool: gpu-dense` | Because Helm deep-merges maps, `values-gdc.yaml` must explicitly null out `cloud.google.com/gke-accelerator` so pods do not remain `Pending` looking for a GKE `nvidia-l4` label on GDC-ag bare-metal A100/H100 nodes. |
+| `blueprints/vllm-gke/values-gdc.yaml` | `model.maxModelLen` | `2048` (tuned for 24GB L4) | `32768` (32k context window on 141GB H200) | A single 141GB H200 GPU retains ~65–75 GB of HBM3e after loading BF16 weights, supporting a 32k context window for multi-document RAG prompts and `Gemma 4` reasoning (`thinking`) blocks without truncation. |
+| `blueprints/vllm-gke/values-gdc.yaml` & `templates/deployment.yaml` | `model.tensorParallelSize` & `resources.limits.gpu` | `1` GPU, `tensorParallelSize: 1` | `resources.limits.gpu=1` **and** `model.tensorParallelSize=1` for **both** `26B` and `31B` on H200 | Because a single 141GB H200 holds the entire 62 GB BF16 `31B` checkpoint plus 65 GB of KV cache, each pool runs on `1` H200 GPU with zero cross-GPU all-reduce latency (set `gpu=2` and `tensorParallelSize=2` only if sharding for higher concurrency or running on smaller 40GB/48GB GPUs). |
+| `blueprints/vllm-gke/values-gdc.yaml` | `resources.limits.memory` & `requests.memory` | `48Gi` limit / `24Gi` request | `96Gi` limit / `64Gi` request (`cpu: 8000m`) | Prevents Linux cgroup `OOMKilled` terminations in host RAM while `vLLM` loads 52 GB–62 GB safetensors checkpoints from SAN storage before transferring tensors into H200 HBM3e. |
+| `blueprints/vllm-gke/values-gdc.yaml` | `nodeSelector` | `cloud.google.com/gke-accelerator: nvidia-l4` | `cloud.google.com/gke-accelerator: null`<br>`pool: gpu-moe` / `pool: gpu-dense` | Because Helm deep-merges maps, `values-gdc.yaml` explicitly nulls out `cloud.google.com/gke-accelerator` so pods do not remain `Pending` looking for a GKE `nvidia-l4` label on GDC-ag H200 nodes. |
 | `blueprints/vllm-gke/values-gdc.yaml` | `image.repository` & `image.tag` | `vllm/vllm-openai:latest` | `${REGISTRY_HOST}/vllm-openai` & `${TAG}` | Redirects container pulls from Docker Hub to the air-gapped GDC Managed Harbor registry. |
 | `blueprints/vllm-gke/values-gdc.yaml` | `persistence.storageClassName` & `accessModes` | `standard-rwo` (`ReadWriteOnce`) | `standard-rwx` (`ReadWriteMany`, `150Gi`) | Aligns PVC provisioning with GDC SAN shared storage so multiple replicas or staging pods can mount the pre-warmed weights volume. |
 | `standalone/manifests/01-gateway.yaml` | `ACTIVE_FRAMEWORK` & `MODEL_ROUTING_CONFIG` | `ACTIVE_FRAMEWORK: "vllm"` | Ensure namespace in DNS matches `${NAMESPACE}` (`http://vllm-26b-vllm-gke-service.${NAMESPACE}.svc.cluster.local:8000`) | If deploying into a custom tenant/platform namespace other than `gemma-inference`, update the service FQDN in `MODEL_ROUTING_CONFIG` so `gemma-gateway` resolves both vLLM pools. |
@@ -358,7 +359,7 @@ Pass the dynamic volume claims created in Step 3.2 and your internal Harbor regi
 export REGISTRY_HOST="harbor.gdc.local/gemma-repo" # Replace with your GDC Managed Harbor path
 export TAG="v1.0.0"
 
-# 1. Deploy GDC Production Release A (26B MoE - Latency Optimized)
+# 1. Deploy GDC Production Release A (26B MoE - Latency Optimized on 1x H200 141GB)
 helm upgrade --install vllm-26b ./blueprints/vllm-gke -n gemma-inference \
   -f ./blueprints/vllm-gke/values-gdc.yaml \
   --set image.repository="${REGISTRY_HOST}/vllm-openai" \
@@ -366,12 +367,12 @@ helm upgrade --install vllm-26b ./blueprints/vllm-gke -n gemma-inference \
   --set persistence.existingClaim="vllm-26b-weights-pvc" \
   --set model.name="/models/gemma-4-26B-A4B-it-weights" \
   --set model.servedModelName="gemma4:26b" \
-  --set model.maxModelLen=8192 \
+  --set model.maxModelLen=32768 \
   --set model.tensorParallelSize=1 \
   --set resources.limits.gpu=1 \
   --set nodeSelector.pool="gpu-moe"
 
-# 2. Deploy GDC Production Release B (31B Dense - Reasoning Optimized)
+# 2. Deploy GDC Production Release B (31B Dense - Reasoning Optimized on 1x H200 141GB)
 helm upgrade --install vllm-31b ./blueprints/vllm-gke -n gemma-inference \
   -f ./blueprints/vllm-gke/values-gdc.yaml \
   --set image.repository="${REGISTRY_HOST}/vllm-openai" \
@@ -379,9 +380,9 @@ helm upgrade --install vllm-31b ./blueprints/vllm-gke -n gemma-inference \
   --set persistence.existingClaim="vllm-31b-weights-pvc" \
   --set model.name="/models/gemma-4-31B-it-weights" \
   --set model.servedModelName="gemma4:31b" \
-  --set model.maxModelLen=8192 \
-  --set model.tensorParallelSize=2 \
-  --set resources.limits.gpu=2 \
+  --set model.maxModelLen=32768 \
+  --set model.tensorParallelSize=1 \
+  --set resources.limits.gpu=1 \
   --set nodeSelector.pool="gpu-dense"
 
 # 3. Deploy the corresponding production vLLM gateway proxy manifest
@@ -391,7 +392,7 @@ export INFERENCE_ENGINE="vllm"
 
 > [!IMPORTANT]
 > **Operational Note on Large Weights Pulling & Initialization Time:**
-> When `vLLM` initializes unquantized `Gemma 4 26B` (~52 GB BF16) and `Gemma 4 31B` (~62 GB BF16) weights from GDC SAN storage (`standard-rwx`) and compiles CUDA graphs across GPUs, **operators should allocate 5–10 minutes for model loading and warmup before running verification checks.**
+> When `vLLM` initializes unquantized `Gemma 4 26B` (~52 GB BF16) and `Gemma 4 31B` (~62 GB BF16) weights from GDC SAN storage (`standard-rwx`) into NVIDIA H200 HBM3e memory and compiles CUDA graphs, **operators should allocate 5–10 minutes for model loading and warmup before running verification checks.**
 
 ---
 
