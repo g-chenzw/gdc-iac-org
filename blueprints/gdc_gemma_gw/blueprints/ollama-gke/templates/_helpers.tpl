@@ -14,3 +14,27 @@
 {{- end }}
 {{- end }}
 {{- end }}
+
+{{- define "ollama.namespace" -}}
+{{- coalesce .Values.global.namespace .Values.namespace .Release.Namespace -}}
+{{- end -}}
+
+{{- define "ollama.image" -}}
+{{- $repo := .Values.image.repository -}}
+{{- $globalReg := .Values.global.registry -}}
+{{- if and $globalReg (or (eq $repo "ollama/ollama") (hasPrefix "harbor.gdc.local/" $repo)) -}}
+{{- printf "%s/%s:%s" (trimSuffix "/" $globalReg) (base $repo) (.Values.image.tag | default "0.20.2") -}}
+{{- else -}}
+{{- printf "%s:%s" $repo (.Values.image.tag | default "0.20.2") -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ollama.labels" -}}
+app.kubernetes.io/name: {{ include "ollama.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- with .Values.global.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}
+

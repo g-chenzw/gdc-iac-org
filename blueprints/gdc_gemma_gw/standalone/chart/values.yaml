@@ -37,3 +37,7 @@ gdc:
 # User Cluster workload execution gate (Stage 5: 5-workload-factory)
 apps:
   enabled: true
+  activeFramework: "ollama" # Set to "vllm" for GDC-ag vLLM production deployments
+  ollamaModelVariant: "26b"
+  modelRoutingConfig: ""    # Optional JSON override; auto-selects vllm-*-vllm-service:8000 when activeFramework="vllm"
+

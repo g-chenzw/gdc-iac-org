@@ -1,9 +1,11 @@
+{{- if .Values.apps.enabled -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "vllm.fullname" . }}
+  namespace: {{ include "vllm.namespace" . }}
   labels:
-    app.kubernetes.io/name: {{ include "vllm.name" . }}
+    {{- include "vllm.labels" . | nindent 4 }}
 spec:
   strategy:
     type: Recreate
@@ -18,11 +20,17 @@ spec:
         app.kubernetes.io/name: {{ include "vllm.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
       nodeSelector:
-        {{- toYaml .Values.nodeSelector | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: vllm
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "vllm.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - "--model"
@@ -81,3 +89,5 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end -}}
+

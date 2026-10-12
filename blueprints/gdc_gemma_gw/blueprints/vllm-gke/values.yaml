@@ -1,11 +1,13 @@
 # Global context parameters injected by the GDC IaC framework (Helmfile / ArgoCD)
 global:
   projectId: "test-project"
-  namespace: "gemma-inference"
-  registry: "harbor.gdc.local/gemma-repo"
+  namespace: ""
+  registry: ""
   imagePullSecrets: []
   commonLabels: {}
   commonAnnotations: {}
+namespace: ""
+
 
 gdc:
   enabled: false
