@@ -598,6 +598,68 @@ def test_prompt_classifier_word_boundaries_and_structural_signals():
     simple_payload = {"messages": [{"role": "user", "content": "Hello"}]}
     assert main.classify_prompt_complexity(simple_payload, {"X-Task-Complexity": "high"}) == "gemma4:31b"
 
+    # Tactical intelligence synthesis prompt (Function 4 in E2E tutorial) routes to 31B Dense
+    tactical_payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Correlate the latest cyber SCADA port scan telemetry at FOB Alpha with acoustic ground sensor detections on Route 9. Assess adversary intent and recommend an alternate supply routing plan.",
+            }
+        ]
+    }
+    assert main.classify_prompt_complexity(tactical_payload) == "gemma4:31b"
+
+
+def test_gateway_admin_oidc_portal_and_rbac(monkeypatch):
+    """Verify gdc-dev-style /login/oidc portal, HMAC session cookies, and 403 RBAC enforcement."""
+    monkeypatch.setattr(main, "_authenticate_keycloak_direct", lambda u, p: None)
+
+    # 1. GET /login/oidc renders the Sovereign Identity portal
+    login_page = client.get("/login/oidc")
+    assert login_page.status_code == 200
+    assert "GDC Sovereign Identity (Keycloak)" in login_page.text
+
+    # 2. Sign in as alice (analyst) -> non-admin role should receive 403 Forbidden on admin mutations
+    alice_login = client.post(
+        "/login/oidc",
+        json={"username": "alice", "password": "password123", "role": "analyst"},
+    )
+    assert alice_login.status_code == 200
+    assert alice_login.json()["is_admin"] is False
+
+    alice_cookies = dict(alice_login.cookies)
+    session_status = client.get("/api/auth/session", cookies=alice_cookies)
+    assert session_status.status_code == 200
+    assert session_status.json()["user"] == "alice"
+    assert session_status.json()["role"] == "analyst"
+    assert session_status.json()["is_admin"] is False
+
+    forbidden_cfg = client.post(
+        "/api/config", json={"temperature": 0.5}, cookies=alice_cookies
+    )
+    assert forbidden_cfg.status_code == 403
+    assert "Admin role required" in forbidden_cfg.json()["detail"]
+
+    # 3. Sign in as charlie (admin) -> full admin control-plane access succeeds
+    charlie_login = client.post(
+        "/login/oidc",
+        json={"username": "charlie", "password": "password123", "role": "admin"},
+    )
+    assert charlie_login.status_code == 200
+    assert charlie_login.json()["is_admin"] is True
+
+    charlie_cookies = dict(charlie_login.cookies)
+    allowed_cfg = client.post(
+        "/api/config", json={"temperature": 0.4}, cookies=charlie_cookies
+    )
+    assert allowed_cfg.status_code == 200
+    assert allowed_cfg.json()["state"]["temperature"] == 0.4
+
+    # 4. Clear cookies via /logout
+    client.cookies.clear()
+    logout_resp = client.get("/logout", follow_redirects=False)
+    assert logout_resp.status_code == 302
+
 
 def test_keycloak_oidc_jwt_verification_and_spoof_prevention(monkeypatch):
     """Verify that when ENABLE_OIDC=true, JWT claims override spoofed X-User-ID headers."""

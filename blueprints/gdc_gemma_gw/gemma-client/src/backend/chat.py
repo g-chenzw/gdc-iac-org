@@ -1,3 +1,4 @@
+import asyncio
 import os
 from openai import OpenAI
 from typing import List
@@ -6,7 +7,8 @@ from storage import get_blob_content
 from models import Message
 
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://gemma-gateway.gemma-inference.svc.cluster.local/v1")
-client = OpenAI(base_url=GATEWAY_URL, api_key="gdc-no-auth-required")
+MAX_CHAT_TOKENS = int(os.getenv("MAX_CHAT_TOKENS", "512"))
+client = OpenAI(base_url=GATEWAY_URL, api_key="gdc-no-auth-required", timeout=240.0)
 
 async def generate_chat_response(
     message: str,
@@ -24,7 +26,7 @@ async def generate_chat_response(
     # System Instruction
     system_instruction = "You are a helpful AI assistant."
     if is_thinking_enabled:
-        system_instruction += " You MUST output your step-by-step thinking process wrapped in <thought>...</thought> tags before your final answer."
+        system_instruction += " You MUST output your step-by-step thinking process wrapped in <thought>...</thought> tags before your final answer. Keep your <thought> section concise (3-5 bullet points) so the tactical synthesis completes rapidly."
     else:
         system_instruction += " Do not output any <thought> tags, thinking process, or internal reasoning steps. Provide ONLY the direct answer to the user's prompt."
 
@@ -68,12 +70,14 @@ async def generate_chat_response(
         if user_id:
             extra_headers["X-User-ID"] = user_id
 
-        response = client.chat.completions.create(
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
             model=model_name or "gemma4:26b",
             messages=openai_history,
             temperature=0.7,
+            max_tokens=MAX_CHAT_TOKENS,
             stream=False,
-            extra_headers=extra_headers
+            extra_headers=extra_headers,
         )
         return response.choices[0].message.content, response.model
     except Exception as e:

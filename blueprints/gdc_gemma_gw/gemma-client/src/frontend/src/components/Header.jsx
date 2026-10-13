@@ -90,7 +90,11 @@ export default function Header({ currentUser, setCurrentUser, selectedModel, set
               <button 
                 onClick={() => {
                   sessionStorage.removeItem('oidc_access_token');
-                  window.location.reload();
+                  sessionStorage.removeItem('oidc_refresh_token');
+                  const authority = import.meta.env.VITE_OIDC_AUTHORITY || `${window.location.origin}/auth/realms/gdc-rag-realm`;
+                  const clientId = import.meta.env.VITE_OIDC_CLIENT_ID || 'rag-frontend';
+                  const redirectUri = encodeURIComponent(window.location.origin);
+                  window.location.href = `${authority}/protocol/openid-connect/logout?client_id=${clientId}&post_logout_redirect_uri=${redirectUri}`;
                 }}
                 className="text-[11px] bg-slate-800 hover:bg-red-500/20 text-slate-300 hover:text-red-400 px-2 py-1 rounded transition-colors font-medium border border-slate-700"
               >

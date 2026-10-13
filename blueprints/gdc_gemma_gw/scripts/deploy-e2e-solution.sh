@@ -62,10 +62,21 @@ sed -e "s|REGISTRY_HOST_PLACEHOLDER|${REGISTRY_HOST}|g" \
 
 # 6. Build and Deploy Joint Intelligence & Readiness Console (gemma-client)
 echo "[5/6] Deploying updated Joint Intelligence & Readiness Console..."
-grep -q "VITE_ENABLE_OIDC" gemma-client/src/frontend/.env 2>/dev/null || echo "VITE_ENABLE_OIDC=true" >> gemma-client/src/frontend/.env
-grep -q "VITE_ENABLE_INTEL_CONSOLE" gemma-client/src/frontend/.env 2>/dev/null || echo "VITE_ENABLE_INTEL_CONSOLE=true" >> gemma-client/src/frontend/.env
+cat << 'EOF' > gemma-client/src/frontend/.env
+VITE_API_URL=/api
+VITE_ENABLE_OIDC=true
+VITE_OIDC_CLIENT_ID=rag-frontend
+VITE_ENABLE_INTEL_CONSOLE=true
+EOF
 chmod +x gemma-client/scripts/build.sh
 ./gemma-client/scripts/build.sh -p "${PROJECT_ID}" -r "${REGISTRY_HOST}"
+
+# Ensure Keycloak realm import ConfigMap (with wildcard Cloud Workstation preview support) is applied
+kubectl apply -f gemma-client/manifests/gcp/keycloak-realm-import.yaml -n "${NAMESPACE}"
+if kubectl get deployment keycloak -n "${NAMESPACE}" >/dev/null 2>&1; then
+  kubectl rollout restart deployment/keycloak -n "${NAMESPACE}"
+  kubectl rollout status deployment/keycloak -n "${NAMESPACE}" --timeout=90s || true
+fi
 
 # Ensure required ServiceAccount and PostgreSQL credentials secret exist before deploying backend
 kubectl create serviceaccount gemma-client-sa -n "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -

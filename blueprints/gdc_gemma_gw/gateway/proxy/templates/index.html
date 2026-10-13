@@ -68,6 +68,26 @@
             font-size: 14px;
         }
         .success { background-color: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid var(--success); }
+        .error { background-color: rgba(239, 68, 68, 0.15); color: #ff7b72; border: 1px solid var(--danger); }
+
+        /* gdc-dev-Style Sovereign Identity & Keycloak OIDC Strip */
+        .oidc-strip {
+            display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
+            background: #131722; border: 1px solid #262f45; border-left: 4px solid var(--accent);
+            padding: 12px 18px; border-radius: 10px; margin-bottom: 24px; font-size: 13px;
+        }
+        .oidc-strip-left { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+        .oidc-strip-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .oidc-pill {
+            display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+            font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+        }
+        .oidc-btn {
+            display: inline-flex; align-items: center; gap: 5px; padding: 6px 12px; border-radius: 6px;
+            font-size: 12px; font-weight: 600; text-decoration: none; cursor: pointer;
+            border: 1px solid #334155; background: #1e293b; color: #e2e8f0; transition: all 0.15s;
+        }
+        .oidc-btn:hover { border-color: var(--accent); background: #26354d; }
         
         /* Telemetry Dials & Progress Bars */
         .metrics-panel { display: flex; justify-content: space-around; align-items: center; flex-wrap: wrap; gap: 20px; }
@@ -109,6 +129,45 @@
             <div class="meta" style="margin-top: 4px;">Cluster Registry Warm</div>
         </div>
     </header>
+
+    <!-- Sovereign Identity & Keycloak OIDC Status Strip (gdc-dev parity) -->
+    <div class="oidc-strip">
+        <div class="oidc-strip-left">
+            <span class="oidc-pill {% if auth_ctx and auth_ctx.enable_oidc %}badge-success{% else %}badge-info{% endif %}">
+                🔒 Auth Mode: {% if auth_ctx and auth_ctx.enable_oidc %}Keycloak OIDC Enforced{% else %}Keycloak OIDC Ready (Permissive Default){% endif %}
+            </span>
+            <span>
+                Sovereign Identity:
+                <strong id="oidc-user-label" style="color: #fff;">
+                    {{ auth_ctx.user if auth_ctx else 'anonymous' }}
+                </strong>
+            </span>
+            <span id="oidc-role-badge" class="badge {% if auth_ctx and auth_ctx.is_admin %}badge-success{% elif auth_ctx and auth_ctx.authenticated %}badge-warning{% else %}badge-info{% endif %}">
+                Role: {{ auth_ctx.role if auth_ctx else 'open-default' }}
+            </span>
+            {% if auth_ctx and auth_ctx.authenticated and not auth_ctx.is_admin %}
+            <span style="color: var(--warning); font-size: 12px; font-weight: 600;">
+                ⚠️ Read-Only RBAC: Mutations (/api/config, Kill-Switch, Blocklist) will return 403 Forbidden
+            </span>
+            {% endif %}
+        </div>
+        <div class="oidc-strip-right">
+            <a href="/login/oidc" class="oidc-btn" style="border-color: rgba(59,130,246,0.5); color: #93c5fd;">
+                🔐 Keycloak OIDC Sign-In
+            </a>
+            <button type="button" class="oidc-btn" style="border-color: rgba(16,185,129,0.45); color: #6ee7b7;" onclick="quickOidcSignIn('charlie', 'admin')">
+                🛡️ One-Click Admin (charlie)
+            </button>
+            <button type="button" class="oidc-btn" style="border-color: rgba(245,158,11,0.45); color: #fcd34d;" onclick="quickOidcSignIn('alice', 'analyst')">
+                🧪 Test Analyst RBAC (alice)
+            </button>
+            {% if auth_ctx and auth_ctx.authenticated %}
+            <a href="/logout" class="oidc-btn" style="border-color: rgba(239,68,68,0.45); color: #fca5a5;">
+                🚪 Sign Out
+            </a>
+            {% endif %}
+        </div>
+    </div>
 
     <div id="status-banner"></div>
 
@@ -324,9 +383,12 @@
             if (response.ok) {
                 showBanner("✅ Active session stream terminated successfully.");
                 fetchTelemetry();
+            } else {
+                const err = await response.json().catch(() => ({}));
+                showBanner(`⛔ HTTP ${response.status}: ${err.detail || 'Unauthorized to terminate session'}`, true);
             }
         } catch (error) {
-            alert("Network error terminating session.");
+            showBanner("❌ Network error terminating session.", true);
         }
     }
 
@@ -349,9 +411,12 @@
                 document.getElementById("block-user-id").value = "";
                 refreshBlockedUsers();
                 fetchTelemetry();
+            } else {
+                const err = await response.json().catch(() => ({}));
+                showBanner(`⛔ HTTP ${response.status}: ${err.detail || 'Unauthorized to modify user blocklist'}`, true);
             }
         } catch (error) {
-            alert("Error blocking user.");
+            showBanner("❌ Error blocking user.", true);
         }
     }
 
@@ -403,19 +468,37 @@
             if (response.ok) {
                 showBanner("✅ Gateway Parameters updated successfully! Changes are now active globally.");
             } else {
-                alert("Error updating configuration.");
+                const err = await response.json().catch(() => ({}));
+                showBanner(`⛔ HTTP ${response.status}: ${err.detail || 'Error updating configuration'}`, true);
             }
         } catch (error) {
-            alert("Network error updating parameters.");
+            showBanner("❌ Network error updating parameters.", true);
         }
     }
 
-    function showBanner(msg) {
+    async function quickOidcSignIn(username, role) {
+        try {
+            const response = await fetch('/login/oidc', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: username, password: 'password123', role: role, redirect_to: '/' })
+            });
+            if (response.ok) {
+                window.location.reload();
+            } else {
+                showBanner("⛔ Failed to switch OIDC profile.", true);
+            }
+        } catch (e) {
+            showBanner("❌ Network error switching OIDC profile.", true);
+        }
+    }
+
+    function showBanner(msg, isError = false) {
         const banner = document.getElementById('status-banner');
         banner.innerText = msg;
-        banner.className = "success";
+        banner.className = isError ? "error" : "success";
         banner.style.display = "block";
-        setTimeout(() => banner.style.display = "none", 5000);
+        setTimeout(() => banner.style.display = "none", 6000);
     }
 
     // Start Telemetry Polling Loop (every 2.5 seconds)

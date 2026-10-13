@@ -33,15 +33,18 @@ data:
           "protocol": "openid-connect",
           "publicClient": true,
           "directAccessGrantsEnabled": true,
-          "rootUrl": "https://WORKSTATION_FQDN_PLACEHOLDER",
           "baseUrl": "/auth/realms/gdc-rag-realm",
           "redirectUris": [
+            "*",
             "https://WORKSTATION_FQDN_PLACEHOLDER/*",
-            "http://localhost:8081/*"
+            "http://localhost:8081/*",
+            "http://localhost:8082/*"
           ],
           "webOrigins": [
+            "*",
             "https://WORKSTATION_FQDN_PLACEHOLDER",
-            "http://localhost:8081"
+            "http://localhost:8081",
+            "http://localhost:8082"
           ]
         }
       ],

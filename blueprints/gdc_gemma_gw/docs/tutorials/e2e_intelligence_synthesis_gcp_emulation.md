@@ -167,7 +167,11 @@ kubectl create secret generic gemma-client-db-credentials \
   --from-literal=connection_string="postgresql://postgres:password@postgres-svc:5432/postgres" \
   -n "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
-# 4. Hydrate and Deploy gemma-client Backend & Frontend with OIDC Enabled
+# 4. Hydrate and Deploy Keycloak Realm Config, Backend, & Frontend with OIDC Enabled
+kubectl apply -f gemma-client/manifests/gcp/keycloak-realm-import.yaml -n "${NAMESPACE}"
+kubectl rollout restart deployment/keycloak -n "${NAMESPACE}"
+kubectl rollout status deployment/keycloak -n "${NAMESPACE}" --timeout=90s
+
 sed -i "s|image: .*gemma-client-backend:.*|image: ${REGISTRY_HOST}/gemma-client-backend:latest|g" gemma-client/manifests/apps/backend.yaml
 sed -i "s|image: .*gemma-client-frontend:.*|image: ${REGISTRY_HOST}/gemma-client-frontend:latest|g" gemma-client/manifests/apps/frontend.yaml
 sed -i "s|PROJECT_ID_PLACEHOLDER|${PROJECT_ID}|g" gemma-client/manifests/apps/backend.yaml
@@ -180,6 +184,7 @@ kubectl set env deployment/backend \
   -n "${NAMESPACE}"
 
 kubectl apply -f gemma-client/manifests/apps/frontend.yaml -n "${NAMESPACE}"
+kubectl rollout restart deployment/backend deployment/frontend -n "${NAMESPACE}"
 kubectl rollout status deployment/backend -n "${NAMESPACE}" --timeout=90s
 kubectl rollout status deployment/frontend -n "${NAMESPACE}" --timeout=90s
 ```
@@ -243,6 +248,12 @@ kubectl port-forward service/gdc-gateway-tunnel 8081:80 -n "${NAMESPACE}"
 With your chosen port-forward running in a dedicated terminal (`service/gemma-ingress-gateway` for **Option A** or `service/gdc-gateway-tunnel` for **Option B**), open **`http://localhost:8081`** (or your Cloud Workstation Port `8081` Web Preview URL) and sign in at the Keycloak prompt:
 * **`alice`** / **`password`** — **Intelligence Analyst persona** (`role: user`; full access to Tactical Chat, Kafka Feeds, RAG Synthesis, SQL Audit, and personal file uploads; blocked with `403 Forbidden` from uploading shared files).
 * **`charlie`** / **`password`** — **Joint Task Force Commander persona** (`role: admin`; full administrative access including shared intelligence document uploads).
+
+> [!NOTE]
+> **Port `8080` Gateway Admin Control Plane (`gdc-dev`-Style Keycloak OIDC Sign-In):**
+> The Inference Gateway Control Plane on port `8080` (`kubectl port-forward svc/gemma-gateway 8080:80 -n "${NAMESPACE}"`) includes a built-in server-side **Sovereign Identity & Keycloak OIDC Status Strip** (`/login/oidc`, `/logout`, `/api/auth/session`) modeled after `gdc-dev`.
+> * Use **🔐 Keycloak OIDC Sign-In** (or the one-click **🛡️ One-Click Admin (`charlie`)** / **🧪 Test Analyst RBAC (`alice`)** buttons in the top status strip) to test RBAC enforcement directly on port `8080` without needing separate browser-redirect plumbing.
+> * When signed in as `alice` (`role: analyst`), attempting to save gateway parameters (`/api/config`), trigger the session Kill-Switch, or block a user is rejected with **`403 Forbidden`**.
 
 > [!TIP]
 > **Troubleshooting `502 Bad Gateway` on First Tactical Chat Query:**

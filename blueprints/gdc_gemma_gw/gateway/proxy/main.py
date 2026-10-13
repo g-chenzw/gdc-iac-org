@@ -1,19 +1,22 @@
 from contextlib import asynccontextmanager
 from datetime import datetime
 import fcntl
+import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import socket
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+import urllib.parse
 import urllib.request
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 import httpx
 import psutil
@@ -49,10 +52,14 @@ _LAST_VLLM_GEN_TOKENS: Dict[str, Tuple[float, float]] = {}
 GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
 GATEWAY_ADMIN_TOKEN = os.getenv("GATEWAY_ADMIN_TOKEN", "")
 ENABLE_OIDC = os.getenv("ENABLE_OIDC", "false").lower() == "true"
+ALLOW_SIMULATED_OIDC = os.getenv("ALLOW_SIMULATED_OIDC", "true").lower() == "true"
 KEYCLOAK_URL = os.getenv(
     "KEYCLOAK_URL", "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
 )
+OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID", "rag-frontend")
 OIDC_ALGORITHMS = ["RS256"]
+SESSION_SECRET = os.getenv("SESSION_SECRET", "gdc-gemma-gateway-sovereign-secret-key")
+ADMIN_ROLE_NAMES = {"admin", "dev-admin", "gdc-admin", "platform-admin", "sovereign-admin"}
 _JWKS_CACHE: Optional[Dict[str, Any]] = None
 
 # Configuration
@@ -378,10 +385,228 @@ def _verify_oidc_jwt(token: str) -> Dict[str, Any]:
         )
 
 
+def _sign_gateway_cookie(user: str, role: str) -> str:
+    """Computes an HMAC-SHA256 signature for the Gateway Admin OIDC session cookie."""
+    secret = os.getenv("SESSION_SECRET", SESSION_SECRET)
+    msg = f"{user}:{role}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def _verify_gateway_cookie(user: str, role: str, sig: str) -> bool:
+    """Verifies the HMAC-SHA256 signature on the Gateway Admin OIDC session cookie."""
+    if not user or not role or not sig:
+        return False
+    expected = _sign_gateway_cookie(user, role)
+    return hmac.compare_digest(expected, sig)
+
+
+def get_gateway_auth_context(request: Request) -> Dict[str, Any]:
+    """
+    Resolves the caller's administrative identity and role from:
+      1. Authorization: Bearer <jwt_or_token> or X-Admin-Token header
+      2. gateway_oidc_token cookie (verified Keycloak RS256 JWT)
+      3. HMAC-signed gateway_auth_user + gateway_auth_role + gateway_auth_sig cookies (gdc-dev style)
+      4. Upstream ingress headers (X-Authenticated-User / X-User-ID + X-User-Roles / X-User-Role)
+    Returns a normalized dict with user, role, roles, authenticated, is_admin, source, and enable_oidc.
+    """
+    enable_oidc = os.getenv("ENABLE_OIDC", str(ENABLE_OIDC)).lower() == "true"
+    allow_sim = os.getenv("ALLOW_SIMULATED_OIDC", str(ALLOW_SIMULATED_OIDC)).lower() == "true"
+    expected_token = os.getenv("GATEWAY_ADMIN_TOKEN", GATEWAY_ADMIN_TOKEN) or os.getenv(
+        "GATEWAY_API_KEY", GATEWAY_API_KEY
+    )
+
+    auth_header = request.headers.get("Authorization", "")
+    bearer_token = (
+        auth_header.split(" ", 1)[1].strip()
+        if auth_header.startswith("Bearer ")
+        else ""
+    )
+    admin_header = request.headers.get("X-Admin-Token", "").strip()
+    api_key_header = request.headers.get("X-API-Key", "").strip()
+
+    # 1. Static Admin Token / API Key match
+    if expected_token:
+        candidate = admin_header or api_key_header or bearer_token
+        if candidate and hmac.compare_digest(candidate, expected_token):
+            hdr_user = (
+                request.headers.get("X-Authenticated-User")
+                or request.headers.get("X-User-ID")
+                or "token-admin"
+            ).strip()
+            raw_roles = (
+                request.headers.get("X-User-Roles")
+                or request.headers.get("X-User-Role")
+                or "admin"
+            )
+            roles = [r.strip().lower() for r in raw_roles.split(",") if r.strip()]
+            is_admin = bool(set(roles) & ADMIN_ROLE_NAMES)
+            return {
+                "authenticated": True,
+                "user": hdr_user,
+                "role": roles[0] if roles else "admin",
+                "roles": roles,
+                "is_admin": is_admin,
+                "source": "static-token",
+                "enable_oidc": enable_oidc,
+                "allow_simulated_oidc": allow_sim,
+            }
+
+    # 2. Bearer JWT or gateway_oidc_token Cookie (Keycloak OIDC JWT)
+    jwt_candidate = bearer_token or request.cookies.get("gateway_oidc_token", "").strip()
+    if jwt_candidate and jwt_candidate.count(".") == 2:
+        try:
+            claims = _verify_oidc_jwt(jwt_candidate)
+            verified_user = str(
+                claims.get("preferred_username") or claims.get("sub") or "oidc-user"
+            )
+            roles = [
+                str(r).lower()
+                for r in claims.get("realm_access", {}).get("roles", [])
+                if r
+            ]
+            is_admin = bool(set(roles) & ADMIN_ROLE_NAMES)
+            primary_role = (
+                "admin"
+                if is_admin
+                else (roles[0] if roles else "user")
+            )
+            return {
+                "authenticated": True,
+                "user": verified_user,
+                "role": primary_role,
+                "roles": roles or [primary_role],
+                "is_admin": is_admin,
+                "source": "keycloak-jwt",
+                "enable_oidc": enable_oidc,
+                "allow_simulated_oidc": allow_sim,
+            }
+        except HTTPException:
+            if bearer_token and enable_oidc:
+                raise
+
+    # 3. HMAC-Signed Gateway Session Cookies (gdc-dev /login/oidc flow)
+    cookie_user = request.cookies.get("gateway_auth_user", "").strip()
+    cookie_role = request.cookies.get("gateway_auth_role", "").strip().lower()
+    cookie_sig = request.cookies.get("gateway_auth_sig", "").strip()
+    if cookie_user and cookie_role and _verify_gateway_cookie(cookie_user, cookie_role, cookie_sig):
+        roles = [r.strip().lower() for r in cookie_role.split(",") if r.strip()]
+        is_admin = bool(set(roles) & ADMIN_ROLE_NAMES)
+        return {
+            "authenticated": True,
+            "user": cookie_user,
+            "role": cookie_role,
+            "roles": roles,
+            "is_admin": is_admin,
+            "source": "oidc-session-cookie",
+            "enable_oidc": enable_oidc,
+            "allow_simulated_oidc": allow_sim,
+        }
+
+    # 4. Explicit Upstream Identity / Role Headers (Ingress / Envoy / Testing)
+    hdr_user = (
+        request.headers.get("X-Authenticated-User")
+        or request.headers.get("X-Forwarded-User")
+        or request.headers.get("X-User-ID")
+        or ""
+    ).strip()
+    hdr_roles_raw = (
+        request.headers.get("X-User-Roles")
+        or request.headers.get("X-User-Role")
+        or ""
+    ).strip()
+    if hdr_user or hdr_roles_raw:
+        roles = [r.strip().lower() for r in hdr_roles_raw.split(",") if r.strip()]
+        if not roles:
+            roles = ["admin"] if not enable_oidc else ["user"]
+        is_admin = bool(set(roles) & ADMIN_ROLE_NAMES)
+        return {
+            "authenticated": True,
+            "user": hdr_user or "header-user",
+            "role": roles[0],
+            "roles": roles,
+            "is_admin": is_admin,
+            "source": "identity-headers",
+            "enable_oidc": enable_oidc,
+            "allow_simulated_oidc": allow_sim,
+        }
+
+    return {
+        "authenticated": False,
+        "user": "anonymous",
+        "role": "anonymous",
+        "roles": [],
+        "is_admin": False,
+        "source": "none",
+        "enable_oidc": enable_oidc,
+        "allow_simulated_oidc": allow_sim,
+    }
+
+
+def _authenticate_keycloak_direct(username: str, password: str) -> Optional[Dict[str, Any]]:
+    """
+    Attempts a direct Resource Owner Password Credentials grant against the in-cluster
+    Keycloak realm (`gdc-rag-realm`) so `/login/oidc` can validate real Keycloak users
+    (`charlie`, `alice`, etc.) when Keycloak is reachable, before falling back to
+    simulated OIDC profiles (`gdc-dev` parity).
+    """
+    keycloak_url = os.getenv("KEYCLOAK_URL", KEYCLOAK_URL).rstrip("/")
+    client_id = os.getenv("OIDC_CLIENT_ID", OIDC_CLIENT_ID)
+    token_url = f"{keycloak_url}/protocol/openid-connect/token"
+    form_data = urllib.parse.urlencode(
+        {
+            "grant_type": "password",
+            "client_id": client_id,
+            "username": username,
+            "password": password,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        token_url,
+        data=form_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            token_payload = json.loads(resp.read().decode("utf-8"))
+            access_token = token_payload.get("access_token", "")
+            roles: List[str] = []
+            preferred_user = username
+            if access_token and jwt is not None:
+                try:
+                    unverified = jwt.decode(
+                        access_token, options={"verify_signature": False}
+                    )
+                    preferred_user = str(
+                        unverified.get("preferred_username") or username
+                    )
+                    roles = [
+                        str(r).lower()
+                        for r in unverified.get("realm_access", {}).get("roles", [])
+                        if r
+                    ]
+                except Exception:
+                    pass
+            if not roles:
+                roles = ["admin", "user"] if username.lower() in ("charlie", "admin") else ["user"]
+            is_admin = bool(set(roles) & ADMIN_ROLE_NAMES)
+            return {
+                "user": preferred_user,
+                "role": "admin" if is_admin else (roles[0] if roles else "user"),
+                "roles": roles,
+                "access_token": access_token,
+                "source": "keycloak-direct",
+            }
+    except Exception as e:
+        logger.debug(f"Direct Keycloak token exchange skipped/fell back to simulated OIDC: {e}")
+        return None
+
+
 def verify_api_auth(request: Request) -> None:
     """
-    Validates API requests using either Keycloak OIDC JWT (when ENABLE_OIDC=true)
-    or GATEWAY_API_KEY (when configured). Stores verified identity on request.state.
+    Validates API requests using either Keycloak OIDC JWT (when ENABLE_OIDC=true),
+    signed Gateway OIDC session cookies, or GATEWAY_API_KEY (when configured).
+    Stores verified identity on request.state.
     """
     enable_oidc = os.getenv("ENABLE_OIDC", str(ENABLE_OIDC)).lower() == "true"
     expected_api_key = os.getenv("GATEWAY_API_KEY", GATEWAY_API_KEY)
@@ -410,14 +635,23 @@ def verify_api_auth(request: Request) -> None:
                 detail="Unauthorized gateway API request",
             )
 
-    # 2. If Keycloak OIDC is enabled, require and verify the Bearer JWT
+    # 2. If Keycloak OIDC is enabled, require and verify the Bearer JWT or signed session cookie
     if enable_oidc:
-        if not bearer_token:
+        cookie_user = request.cookies.get("gateway_auth_user", "").strip()
+        cookie_role = request.cookies.get("gateway_auth_role", "").strip().lower()
+        cookie_sig = request.cookies.get("gateway_auth_sig", "").strip()
+        if cookie_user and cookie_role and _verify_gateway_cookie(cookie_user, cookie_role, cookie_sig):
+            request.state.verified_user_id = cookie_user
+            request.state.verified_roles = [cookie_role]
+            return
+
+        token_candidate = bearer_token or request.cookies.get("gateway_oidc_token", "").strip()
+        if not token_candidate:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing OIDC Bearer token",
             )
-        claims = _verify_oidc_jwt(bearer_token)
+        claims = _verify_oidc_jwt(token_candidate)
         verified_user = claims.get("preferred_username") or claims.get("sub")
         if not verified_user:
             raise HTTPException(
@@ -430,8 +664,11 @@ def verify_api_auth(request: Request) -> None:
 
 def verify_admin_auth(request: Request) -> None:
     """
-    Validates administrative control-plane requests using GATEWAY_ADMIN_TOKEN,
-    GATEWAY_API_KEY, or a Keycloak OIDC JWT containing the 'admin' realm role.
+    Validates administrative control-plane requests using:
+      1. GATEWAY_ADMIN_TOKEN or GATEWAY_API_KEY
+      2. Keycloak OIDC Bearer JWT or gateway_oidc_token cookie with 'admin' role
+      3. HMAC-signed Gateway OIDC session cookie (gateway_auth_user / gateway_auth_role)
+      4. Explicit X-User-Roles / X-User-Role RBAC checks (blocks non-admin roles such as 'user' or 'analyst')
     """
     enable_oidc = os.getenv("ENABLE_OIDC", str(ENABLE_OIDC)).lower() == "true"
     expected = os.getenv("GATEWAY_ADMIN_TOKEN", GATEWAY_ADMIN_TOKEN) or os.getenv(
@@ -445,29 +682,77 @@ def verify_admin_auth(request: Request) -> None:
     )
     admin_header = request.headers.get("X-Admin-Token", "").strip()
 
+    # 1. Check explicit static token when configured
     if expected:
         candidate = admin_header or bearer_token
         if candidate and hmac.compare_digest(candidate, expected):
             return
         if not enable_oidc:
+            # Also allow valid HMAC-signed admin session cookie if user logged in via UI
+            ctx = get_gateway_auth_context(request)
+            if ctx["authenticated"] and ctx["source"] == "oidc-session-cookie":
+                if not ctx["is_admin"]:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"Admin role required for gateway control plane (current role: {ctx['role']})",
+                    )
+                return
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Unauthorized gateway admin request",
             )
 
+    # 2. Check HMAC-signed OIDC session cookie (from /login/oidc) or explicit role headers
+    cookie_user = request.cookies.get("gateway_auth_user", "").strip()
+    cookie_role = request.cookies.get("gateway_auth_role", "").strip().lower()
+    cookie_sig = request.cookies.get("gateway_auth_sig", "").strip()
+    if cookie_user and cookie_role and _verify_gateway_cookie(cookie_user, cookie_role, cookie_sig):
+        roles = {r.strip().lower() for r in cookie_role.split(",") if r.strip()}
+        if not (roles & ADMIN_ROLE_NAMES):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Admin role required for gateway control plane (user '{cookie_user}' has role '{cookie_role}')",
+            )
+        request.state.verified_user_id = cookie_user
+        request.state.verified_roles = list(roles)
+        return
+
+    hdr_roles_raw = (
+        request.headers.get("X-User-Roles")
+        or request.headers.get("X-User-Role")
+        or ""
+    ).strip()
+    if hdr_roles_raw:
+        hdr_roles = {r.strip().lower() for r in hdr_roles_raw.split(",") if r.strip()}
+        if not (hdr_roles & ADMIN_ROLE_NAMES):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Admin role required for gateway control plane (role '{hdr_roles_raw}' is not permitted)",
+            )
+
+    # 3. If Keycloak OIDC is enabled, require and verify the Bearer JWT or gateway_oidc_token cookie
     if enable_oidc:
-        if not bearer_token:
+        token_candidate = bearer_token or request.cookies.get("gateway_oidc_token", "").strip()
+        if not token_candidate:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing OIDC admin Bearer token",
+                detail="Missing OIDC admin Bearer token or session. Sign in at /login/oidc.",
             )
-        claims = _verify_oidc_jwt(bearer_token)
-        roles = claims.get("realm_access", {}).get("roles", [])
-        if "admin" not in roles:
+        claims = _verify_oidc_jwt(token_candidate)
+        roles = [
+            str(r).lower()
+            for r in claims.get("realm_access", {}).get("roles", [])
+            if r
+        ]
+        if not (set(roles) & ADMIN_ROLE_NAMES):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin role required for gateway control plane",
             )
+        request.state.verified_user_id = str(
+            claims.get("preferred_username") or claims.get("sub") or "admin"
+        )
+        request.state.verified_roles = roles
 
 
 def flatten_system_message(messages: list) -> list:
@@ -532,10 +817,231 @@ class UpdateConfigRequest(BaseModel):
     model_variant: str = None
 
 
+def render_gateway_login_portal(
+    error_msg: str = "", redirect_to: str = "/", current_ctx: Optional[Dict[str, Any]] = None
+) -> HTMLResponse:
+    """Renders the gdc-dev-style Sovereign Identity & Keycloak OIDC Login Portal for Port 8080."""
+    err_html = (
+        f'<div style="background:rgba(248,81,73,0.15);border:1px solid #f85149;color:#ff7b72;padding:12px 14px;border-radius:8px;margin-bottom:18px;font-size:13px;">⚠️ {error_msg}</div>'
+        if error_msg
+        else ""
+    )
+    active_banner = ""
+    if current_ctx and current_ctx.get("authenticated"):
+        badge_color = "#238636" if current_ctx.get("is_admin") else "#d29922"
+        active_banner = f"""
+        <div style="background:rgba(56,139,253,0.1);border:1px solid rgba(56,139,253,0.3);padding:10px 14px;border-radius:8px;margin-bottom:18px;font-size:12px;display:flex;justify-content:space-between;align-items:center;">
+            <span>Signed in as <strong>{current_ctx.get("user")}</strong> <span style="background:{badge_color};color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;margin-left:6px;">{current_ctx.get("role")}</span></span>
+            <a href="/logout" style="color:#ff7b72;text-decoration:none;font-weight:600;">Sign Out</a>
+        </div>
+        """
+
+    html = f"""<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <title>GDC Sovereign Identity — Keycloak OIDC Sign-In</title>
+    <style>
+        body {{ background:#090d16; color:#e2e8f0; font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:20px; box-sizing:border-box; }}
+        .card {{ background:#111827; border:1px solid #1f2937; border-top:4px solid #3b82f6; border-radius:12px; padding:34px; width:100%; max-width:440px; box-shadow:0 20px 45px rgba(0,0,0,0.65); }}
+        .logo {{ display:flex; align-items:center; gap:12px; margin-bottom:20px; }}
+        .logo-badge {{ width:40px; height:40px; border-radius:10px; background:linear-gradient(135deg,#2563eb,#6366f1); display:flex; align-items:center; justify-content:center; font-weight:800; color:#fff; font-size:18px; }}
+        h2 {{ margin:0; font-size:19px; color:#f8fafc; }}
+        .sub {{ font-size:12px; color:#94a3b8; margin-top:2px; }}
+        label {{ display:block; font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:#94a3b8; margin-bottom:6px; font-weight:600; }}
+        input, select {{ width:100%; padding:10px 12px; margin-bottom:14px; background:#090d16; border:1px solid #334155; color:#f8fafc; border-radius:6px; box-sizing:border-box; font-size:13px; }}
+        input:focus, select:focus {{ outline:none; border-color:#3b82f6; }}
+        .btn-primary {{ width:100%; padding:11px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; font-size:14px; cursor:pointer; transition:background 0.15s; }}
+        .btn-primary:hover {{ background:#1d4ed8; }}
+        .divider {{ display:flex; align-items:center; gap:10px; margin:18px 0 12px; color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }}
+        .divider::before, .divider::after {{ content:""; flex:1; border-top:1px solid #1f2937; }}
+        .quick-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
+        .btn-quick {{ padding:9px 10px; border-radius:6px; border:1px solid #334155; background:#1e293b; color:#e2e8f0; font-size:12px; font-weight:600; cursor:pointer; text-align:center; }}
+        .btn-quick:hover {{ border-color:#3b82f6; background:#26354d; }}
+        .meta {{ margin-top:18px; padding-top:14px; border-top:1px solid #1f2937; font-size:11px; color:#64748b; display:flex; justify-content:space-between; }}
+        .meta a {{ color:#60a5fa; text-decoration:none; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="logo">
+            <div class="logo-badge">G4</div>
+            <div>
+                <h2>GDC Sovereign Identity (Keycloak)</h2>
+                <div class="sub">Realm: <code>gdc-rag-realm</code> • Port 8080 Gateway Control Plane</div>
+            </div>
+        </div>
+        {err_html}
+        {active_banner}
+        <form method="POST" action="/login/oidc">
+            <input type="hidden" name="redirect_to" value="{redirect_to}" />
+            <label>Keycloak / Sovereign Username</label>
+            <input type="text" name="username" value="charlie" placeholder="charlie (Admin) or alice (Analyst)" required />
+            <label>Password</label>
+            <input type="password" name="password" value="password123" placeholder="password123" required />
+            <label>Requested OIDC Realm Role</label>
+            <select name="role">
+                <option value="admin" selected>admin (Full Gateway Control Plane Access)</option>
+                <option value="dev-admin">dev-admin (GDC Platform Operator)</option>
+                <option value="analyst">analyst (Read-Only Telemetry — Tests 403 RBAC)</option>
+                <option value="user">user (Standard Inference User — Tests 403 RBAC)</option>
+            </select>
+            <button type="submit" class="btn-primary">Sign In with Keycloak OIDC</button>
+        </form>
+
+        <div class="divider">One-Click Sovereign Profiles (gdc-dev style)</div>
+        <div class="quick-grid">
+            <form method="POST" action="/login/oidc" style="margin:0;">
+                <input type="hidden" name="redirect_to" value="{redirect_to}" />
+                <input type="hidden" name="username" value="charlie" />
+                <input type="hidden" name="password" value="password123" />
+                <input type="hidden" name="role" value="admin" />
+                <button type="submit" class="btn-quick" style="width:100%;border-color:rgba(34,197,94,0.4);color:#4ade80;">🛡️ charlie (admin)</button>
+            </form>
+            <form method="POST" action="/login/oidc" style="margin:0;">
+                <input type="hidden" name="redirect_to" value="{redirect_to}" />
+                <input type="hidden" name="username" value="alice" />
+                <input type="hidden" name="password" value="password123" />
+                <input type="hidden" name="role" value="analyst" />
+                <button type="submit" class="btn-quick" style="width:100%;border-color:rgba(234,179,8,0.4);color:#facc15;">🧪 alice (analyst 403)</button>
+            </form>
+        </div>
+
+        <div class="meta">
+            <span>Federation: OIDC + HMAC Session</span>
+            <a href="/">← Return to Control Plane</a>
+        </div>
+    </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/login", response_class=HTMLResponse)
+@app.get("/login/oidc", response_class=HTMLResponse)
+async def gateway_oidc_login_page(request: Request, redirect_to: str = "/"):
+    """Serves the gdc-dev-style Keycloak OIDC login portal for the Gateway Control Plane."""
+    ctx = get_gateway_auth_context(request)
+    return render_gateway_login_portal(redirect_to=redirect_to, current_ctx=ctx)
+
+
+@app.post("/login/oidc")
+async def gateway_oidc_login_submit(request: Request):
+    """
+    Authenticates the user via direct Keycloak ROPC token exchange (when Keycloak is live)
+    or gdc-dev-style simulated OIDC profile, and sets HMAC-SHA256 signed session cookies.
+    """
+    content_type = request.headers.get("content-type", "")
+    username = "charlie"
+    password = "password123"
+    requested_role = "admin"
+    redirect_to = "/"
+
+    if "application/json" in content_type:
+        body = await request.json()
+        username = str(body.get("username", "charlie")).strip()
+        password = str(body.get("password", "password123"))
+        requested_role = str(body.get("role", "")).strip().lower()
+        redirect_to = str(body.get("redirect_to", "/")).strip() or "/"
+    else:
+        raw_body = (await request.body()).decode("utf-8", errors="replace")
+        parsed_qs = urllib.parse.parse_qs(raw_body)
+        username = parsed_qs.get("username", ["charlie"])[0].strip()
+        password = parsed_qs.get("password", ["password123"])[0]
+        requested_role = parsed_qs.get("role", [""])[0].strip().lower()
+        redirect_to = parsed_qs.get("redirect_to", ["/"])[0].strip() or "/"
+
+    if not username:
+        return render_gateway_login_portal(
+            error_msg="Username is required.", redirect_to=redirect_to
+        )
+
+    # Known sovereign test profiles (matching keycloak-realm-import.yaml & gdc-dev)
+    known_passwords = {
+        "charlie": "password123",
+        "alice": "password123",
+        "bob": "password123",
+        "admin": "admin",
+        "dev-admin": "admin",
+    }
+    default_roles = {
+        "charlie": "admin",
+        "admin": "admin",
+        "dev-admin": "dev-admin",
+        "alice": "analyst",
+        "bob": "user",
+    }
+
+    # 1. Try live Keycloak token endpoint first
+    kc_auth = _authenticate_keycloak_direct(username, password)
+    access_token = ""
+    if kc_auth:
+        final_user = kc_auth["user"]
+        final_role = requested_role or kc_auth["role"]
+        access_token = kc_auth.get("access_token", "")
+    else:
+        # 2. Fall back to gdc-dev simulated OIDC validation
+        allow_sim = os.getenv("ALLOW_SIMULATED_OIDC", str(ALLOW_SIMULATED_OIDC)).lower() == "true"
+        if not allow_sim:
+            return render_gateway_login_portal(
+                error_msg="Keycloak OIDC server unreachable and ALLOW_SIMULATED_OIDC is disabled.",
+                redirect_to=redirect_to,
+            )
+        expected_pw = known_passwords.get(username.lower())
+        if expected_pw and password != expected_pw:
+            return render_gateway_login_portal(
+                error_msg=f"Invalid password for sovereign identity '{username}'.",
+                redirect_to=redirect_to,
+            )
+        final_user = username
+        final_role = requested_role or default_roles.get(username.lower(), "admin")
+
+    sig = _sign_gateway_cookie(final_user, final_role)
+    if "application/json" in content_type:
+        resp = JSONResponse(
+            {
+                "status": "authenticated",
+                "user": final_user,
+                "role": final_role,
+                "is_admin": final_role in ADMIN_ROLE_NAMES,
+            }
+        )
+    else:
+        resp = RedirectResponse(url=redirect_to, status_code=302)
+
+    resp.set_cookie("gateway_auth_user", final_user, path="/", httponly=False, samesite="lax")
+    resp.set_cookie("gateway_auth_role", final_role, path="/", httponly=False, samesite="lax")
+    resp.set_cookie("gateway_auth_sig", sig, path="/", httponly=True, samesite="lax")
+    resp.delete_cookie("gateway_logged_out", path="/")
+    if access_token:
+        resp.set_cookie("gateway_oidc_token", access_token, path="/", httponly=True, samesite="lax")
+    return resp
+
+
+@app.get("/logout")
+async def gateway_oidc_logout():
+    """Clears Gateway OIDC session cookies and redirects to the OIDC sign-in portal."""
+    resp = RedirectResponse(url="/login/oidc", status_code=302)
+    resp.delete_cookie("gateway_auth_user", path="/")
+    resp.delete_cookie("gateway_auth_role", path="/")
+    resp.delete_cookie("gateway_auth_sig", path="/")
+    resp.delete_cookie("gateway_oidc_token", path="/")
+    return resp
+
+
+@app.get("/api/auth/session")
+async def gateway_auth_session_status(request: Request):
+    """Returns the current Gateway Admin Control Plane OIDC session and RBAC status."""
+    return get_gateway_auth_context(request)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def admin_ui(request: Request):
-    """Serves the GDC-styled Admin UI."""
+    """Serves the GDC-styled Admin UI with Keycloak OIDC session context."""
+    if request.query_params.get("logout") == "true":
+        return await gateway_oidc_logout()
     sync_shared_state()
+    auth_ctx = get_gateway_auth_context(request)
     return templates.TemplateResponse(
         request=request,
         name="index.html",
@@ -543,6 +1049,7 @@ async def admin_ui(request: Request):
             "state": CURRENT_STATE,
             "active_framework": ACTIVE_FRAMEWORK,
             "model_routing": MODEL_ROUTING_CONFIG,
+            "auth_ctx": auth_ctx,
         },
     )
 
@@ -934,7 +1441,8 @@ _COMPLEXITY_PHRASES_RE = re.compile(
     r"algorithm|algorithms|implement|implementation|refactor|debug|debugging|"
     r"optimize|architecture|sql|math|mathematics|calculate|prove|equation|equations|"
     r"formula|formulas|derivative|derivatives|integral|integrals|theorem|"
-    r"reason|reasoning|analyze|analysis|logic|deduce|proof"
+    r"reason|reasoning|analyze|analysis|logic|deduce|proof|"
+    r"correlate|correlation|assess|synthesize"
     r")\b"
     r")",
     re.IGNORECASE,
