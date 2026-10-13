@@ -167,12 +167,15 @@ export default function Header({
               </span>
               <button 
                 onClick={() => {
+                  const idToken = sessionStorage.getItem('oidc_id_token');
                   sessionStorage.removeItem('oidc_access_token');
                   sessionStorage.removeItem('oidc_refresh_token');
+                  sessionStorage.removeItem('oidc_id_token');
                   const authority = import.meta.env.VITE_OIDC_AUTHORITY || `${window.location.origin}/auth/realms/gdc-rag-realm`;
                   const clientId = import.meta.env.VITE_OIDC_CLIENT_ID || 'rag-frontend';
                   const redirectUri = encodeURIComponent(window.location.origin);
-                  window.location.href = `${authority}/protocol/openid-connect/logout?client_id=${clientId}&post_logout_redirect_uri=${redirectUri}`;
+                  const hintParam = idToken ? `&id_token_hint=${encodeURIComponent(idToken)}` : '';
+                  window.location.href = `${authority}/protocol/openid-connect/logout?client_id=${clientId}&post_logout_redirect_uri=${redirectUri}${hintParam}`;
                 }}
                 className="text-[11px] bg-slate-800 hover:bg-red-500/20 text-slate-300 hover:text-red-400 px-2 py-1 rounded transition-colors font-medium border border-slate-700"
               >

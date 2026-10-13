@@ -78,6 +78,9 @@ function App() {
           if (tokenData.refresh_token) {
             sessionStorage.setItem('oidc_refresh_token', tokenData.refresh_token);
           }
+          if (tokenData.id_token) {
+            sessionStorage.setItem('oidc_id_token', tokenData.id_token);
+          }
           
           // Wipe authorization code query strings from browser URL preview bar
           window.history.replaceState({}, document.title, window.location.pathname);
