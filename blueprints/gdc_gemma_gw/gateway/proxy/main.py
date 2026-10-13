@@ -1874,6 +1874,49 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
     }
     persist_shared_state()
 
+    def _get_alternate_engine_base_url(current_base: str, model_tag: str) -> Optional[str]:
+        variant = "31b" if "31b" in model_tag else "26b"
+        if "vllm-" in current_base:
+            return f"http://ollama-{variant}-service:11434"
+        if "ollama-" in current_base:
+            return f"http://vllm-{variant}-vllm-gke-service:8000"
+        return None
+
+    def _normalize_sse_line(raw_line: str) -> str:
+        if not raw_line.startswith("data: "):
+            return raw_line
+        data_part = raw_line[6:].strip()
+        if not data_part or data_part == "[DONE]":
+            return raw_line
+        try:
+            chunk_obj = json.loads(data_part)
+            if not isinstance(chunk_obj, dict):
+                return raw_line
+            choices = chunk_obj.get("choices")
+            if not isinstance(choices, list):
+                return raw_line
+            modified = False
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                content_val = delta.get("content")
+                reasoning_val = (
+                    delta.get("reasoning")
+                    or delta.get("reasoning_content")
+                    or delta.get("thinking")
+                )
+                if not content_val and isinstance(reasoning_val, str) and reasoning_val:
+                    delta["content"] = reasoning_val
+                    modified = True
+            if modified:
+                return f"data: {json.dumps(chunk_obj)}"
+        except Exception:
+            pass
+        return raw_line
+
     if payload.get("stream", False):
         ACTIVE_COMPLETIONS_COUNT += 1
 
@@ -1881,96 +1924,113 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
             global ACTIVE_COMPLETIONS_COUNT, UNSUPPORTED_SYSTEM_ROLE_MODELS
             current_payload = payload
             streamed_chunks = 0
+            active_target_url = target_url
             try:
                 async with borrow_http_client(timeout) as client:
-                    async with client.stream(
-                        "POST", target_url, json=current_payload, headers=headers
-                    ) as response:
-                        # Catch system role limitation in-flight for streaming and register/retry
-                        if response.status_code == 400:
-                            error_content = await response.aread()
-                            error_msg = ""
-                            try:
-                                error_json = json.loads(error_content.decode("utf-8"))
-                                error_msg = error_json.get("error", {}).get(
-                                    "message", ""
-                                )
-                            except Exception:
-                                pass
-
-                            if "System role not supported" in error_msg:
-                                logger.warning(
-                                    f"Detected System role limitation on backend {determined_tag}. Registering capability and retrying..."
-                                )
-                                UNSUPPORTED_SYSTEM_ROLE_MODELS.add(determined_tag)
-                                persist_shared_state()
-
-                                # Flatten system message and retry in-flight
-                                retry_payload = current_payload.copy()
-                                retry_payload["messages"] = flatten_system_message(
-                                    current_payload["messages"]
-                                )
-
-                                async with client.stream(
-                                    "POST",
-                                    target_url,
-                                    json=retry_payload,
-                                    headers=headers,
-                                ) as retry_response:
-                                    if retry_response.status_code != 200:
-                                        retry_error = await retry_response.aread()
-                                        logger.error(
-                                            f"Retried inference engine failed: {retry_error}"
+                    for attempt_idx in range(2):
+                        try:
+                            async with client.stream(
+                                "POST", active_target_url, json=current_payload, headers=headers
+                            ) as response:
+                                # Catch system role limitation in-flight for streaming and register/retry
+                                if response.status_code == 400:
+                                    error_content = await response.aread()
+                                    error_msg = ""
+                                    try:
+                                        error_json = json.loads(error_content.decode("utf-8"))
+                                        error_msg = error_json.get("error", {}).get(
+                                            "message", ""
                                         )
-                                        yield f"data: {json.dumps({'error': {'message': 'Inference engine error'}})}\n\n".encode(
+                                    except Exception:
+                                        pass
+
+                                    if "System role not supported" in error_msg:
+                                        logger.warning(
+                                            f"Detected System role limitation on backend {determined_tag}. Registering capability and retrying..."
+                                        )
+                                        UNSUPPORTED_SYSTEM_ROLE_MODELS.add(determined_tag)
+                                        persist_shared_state()
+
+                                        # Flatten system message and retry in-flight
+                                        retry_payload = current_payload.copy()
+                                        retry_payload["messages"] = flatten_system_message(
+                                            current_payload["messages"]
+                                        )
+
+                                        async with client.stream(
+                                            "POST",
+                                            active_target_url,
+                                            json=retry_payload,
+                                            headers=headers,
+                                        ) as retry_response:
+                                            if retry_response.status_code != 200:
+                                                retry_error = await retry_response.aread()
+                                                logger.error(
+                                                    f"Retried inference engine failed: {retry_error}"
+                                                )
+                                                yield f"data: {json.dumps({'error': {'message': 'Inference engine error'}})}\n\n".encode(
+                                                    "utf-8"
+                                                )
+                                                return
+
+                                            async for line in retry_response.aiter_lines():
+                                                sync_shared_state()
+                                                if ACTIVE_SESSIONS.get(session_id, {}).get(
+                                                    "killed", False
+                                                ):
+                                                    yield f"data: {json.dumps({'choices': [{'delta': {'content': '[Stream Terminated By Administrator]'}}], 'finish_reason': 'stop'})}\n\n".encode(
+                                                        "utf-8"
+                                                    )
+                                                    return
+                                                streamed_chunks += 1
+                                                yield f"{_normalize_sse_line(line)}\n".encode("utf-8")
+                                        return
+                                    else:
+                                        logger.error(
+                                            f"Inference engine returned 400 bad request: {error_content}"
+                                        )
+                                        yield f"data: {json.dumps({'error': {'message': error_msg or 'Bad Request'}})}\n\n".encode(
                                             "utf-8"
                                         )
                                         return
 
-                                    async for line in retry_response.aiter_lines():
-                                        sync_shared_state()
-                                        if ACTIVE_SESSIONS.get(session_id, {}).get(
-                                            "killed", False
-                                        ):
-                                            yield f"data: {json.dumps({'choices': [{'delta': {'content': '[Stream Terminated By Administrator]'}}], 'finish_reason': 'stop'})}\n\n".encode(
-                                                "utf-8"
-                                            )
-                                            return
-                                        streamed_chunks += 1
-                                        yield f"{line}\n".encode("utf-8")
-                                return
-                            else:
-                                logger.error(
-                                    f"Inference engine returned 400 bad request: {error_content}"
-                                )
-                                yield f"data: {json.dumps({'error': {'message': error_msg or 'Bad Request'}})}\n\n".encode(
-                                    "utf-8"
-                                )
-                                return
+                                elif response.status_code != 200:
+                                    error_content = await response.aread()
+                                    logger.error(
+                                        f"Inference engine returned error code {response.status_code}: {error_content}"
+                                    )
+                                    yield f"data: {json.dumps({'error': {'message': 'Inference engine error'}})}\n\n".encode(
+                                        "utf-8"
+                                    )
+                                    return
 
-                        elif response.status_code != 200:
-                            error_content = await response.aread()
-                            logger.error(
-                                f"Inference engine returned error code {response.status_code}: {error_content}"
+                                async for line in response.aiter_lines():
+                                    # Synchronize shared state so multi-replica kill-switches take effect immediately
+                                    sync_shared_state()
+                                    if ACTIVE_SESSIONS.get(session_id, {}).get("killed", False):
+                                        logger.warning(
+                                            f"Streaming connection killed in-flight for session: {session_id}"
+                                        )
+                                        yield f"data: {json.dumps({'choices': [{'delta': {'content': '[Stream Terminated By Administrator]'}}], 'finish_reason': 'stop'})}\n\n".encode(
+                                            "utf-8"
+                                        )
+                                        return
+                                    streamed_chunks += 1
+                                    yield f"{_normalize_sse_line(line)}\n".encode("utf-8")
+                                break
+                        except httpx.RequestError as stream_err:
+                            alt_base = (
+                                _get_alternate_engine_base_url(base_url, determined_tag)
+                                if (attempt_idx == 0 and streamed_chunks == 0 and httpx.AsyncClient is _REAL_ASYNC_CLIENT_CLS)
+                                else None
                             )
-                            yield f"data: {json.dumps({'error': {'message': 'Inference engine error'}})}\n\n".encode(
-                                "utf-8"
-                            )
-                            return
-
-                        async for line in response.aiter_lines():
-                            # Synchronize shared state so multi-replica kill-switches take effect immediately
-                            sync_shared_state()
-                            if ACTIVE_SESSIONS.get(session_id, {}).get("killed", False):
+                            if alt_base:
+                                active_target_url = f"{alt_base}/v1/chat/completions"
                                 logger.warning(
-                                    f"Streaming connection killed in-flight for session: {session_id}"
+                                    f"Primary streaming backend {target_url} unreachable ({stream_err}); failing over to {active_target_url}"
                                 )
-                                yield f"data: {json.dumps({'choices': [{'delta': {'content': '[Stream Terminated By Administrator]'}}], 'finish_reason': 'stop'})}\n\n".encode(
-                                    "utf-8"
-                                )
-                                return
-                            streamed_chunks += 1
-                            yield f"{line}\n".encode("utf-8")
+                                continue
+                            raise
             except httpx.RequestError as e:
                 logger.error(f"Inference engine streaming error: {e}")
                 yield f"data: {json.dumps({'error': {'message': 'Error communicating with backend service'}})}\n\n".encode(
@@ -1992,10 +2052,52 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
         )
 
     # Non-Streaming completions block
+    def _normalize_completion_choices(body: Any, include_thinking: bool = True) -> Any:
+        if not isinstance(body, dict):
+            return body
+        choices = body.get("choices")
+        if not isinstance(choices, list):
+            return body
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            msg = choice.get("message")
+            if not isinstance(msg, dict):
+                continue
+            content = (msg.get("content") or "").strip()
+            reasoning = (
+                msg.get("reasoning")
+                or msg.get("reasoning_content")
+                or msg.get("thinking")
+                or ""
+            ).strip()
+            if content and reasoning and include_thinking and "<thought>" not in content.lower():
+                msg["content"] = f"<thought>\n{reasoning}\n</thought>\n\n{content}"
+            elif not content and reasoning:
+                msg["content"] = reasoning
+        return body
+
+    include_thinking = payload.get("think", True) is not False
     ACTIVE_COMPLETIONS_COUNT += 1
     try:
         async with borrow_http_client(timeout) as client:
-            response = await client.post(target_url, json=payload, headers=headers)
+            try:
+                response = await client.post(target_url, json=payload, headers=headers)
+            except httpx.RequestError as primary_err:
+                alt_base = (
+                    _get_alternate_engine_base_url(base_url, determined_tag)
+                    if httpx.AsyncClient is _REAL_ASYNC_CLIENT_CLS
+                    else None
+                )
+                if not alt_base:
+                    raise
+                alt_target_url = f"{alt_base}/v1/chat/completions"
+                logger.warning(
+                    f"Primary backend {target_url} unreachable ({primary_err}); failing over to {alt_target_url}"
+                )
+                response = await client.post(alt_target_url, json=payload, headers=headers)
+                target_url = alt_target_url
+                base_url = alt_base
 
             # Catch system role limitation on non-streaming and register/retry
             if response.status_code == 400:
@@ -2021,7 +2123,9 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                         logger.info(
                             f"[Retry Engine] Retry status: {retry_response.status_code}, body: {retry_response.text}"
                         )
-                        retry_body = retry_response.json()
+                        retry_body = _normalize_completion_choices(
+                            retry_response.json(), include_thinking=include_thinking
+                        )
                         if isinstance(retry_body, dict):
                             usage = retry_body.get("usage", {})
                             _record_completion_tokens(
@@ -2041,7 +2145,9 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                         f"[Retry Engine] Exception during retry flattening: {e}"
                     )
 
-            resp_body = response.json()
+            resp_body = _normalize_completion_choices(
+                response.json(), include_thinking=include_thinking
+            )
             if isinstance(resp_body, dict):
                 usage = resp_body.get("usage", {})
                 _record_completion_tokens(int(usage.get("completion_tokens", 0) or 0))
