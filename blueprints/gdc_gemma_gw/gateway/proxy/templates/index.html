@@ -133,8 +133,8 @@
     <!-- Sovereign Identity & Keycloak OIDC Status Strip (gdc-dev parity) -->
     <div class="oidc-strip">
         <div class="oidc-strip-left">
-            <span class="oidc-pill {% if auth_ctx and auth_ctx.enable_oidc %}badge-success{% else %}badge-info{% endif %}">
-                🔒 Auth Mode: {% if auth_ctx and auth_ctx.enable_oidc %}Keycloak OIDC Enforced{% else %}Keycloak OIDC Ready (Permissive Default){% endif %}
+            <span class="oidc-pill {% if auth_ctx and auth_ctx.authenticated %}badge-success{% else %}badge-info{% endif %}">
+                🔒 Auth Mode: {% if auth_ctx and auth_ctx.source == 'keycloak-jwt' %}Keycloak OIDC JWT Verified{% elif auth_ctx and auth_ctx.authenticated %}Keycloak OIDC Session Active{% else %}Keycloak OIDC Ready{% endif %}
             </span>
             <span>
                 Sovereign Identity:
@@ -152,8 +152,11 @@
             {% endif %}
         </div>
         <div class="oidc-strip-right">
+            <a href="/login/keycloak" class="oidc-btn" style="border-color: rgba(99,102,241,0.6); color: #a5b4fc;">
+                🔑 Keycloak SSO Redirect (/auth)
+            </a>
             <a href="/login/oidc" class="oidc-btn" style="border-color: rgba(59,130,246,0.5); color: #93c5fd;">
-                🔐 Keycloak OIDC Sign-In
+                🔐 OIDC Portal
             </a>
             <button type="button" class="oidc-btn" style="border-color: rgba(16,185,129,0.45); color: #6ee7b7;" onclick="quickOidcSignIn('charlie', 'admin')">
                 🛡️ One-Click Admin (charlie)
@@ -162,8 +165,8 @@
                 🧪 Test Analyst RBAC (alice)
             </button>
             {% if auth_ctx and auth_ctx.authenticated %}
-            <a href="/logout" class="oidc-btn" style="border-color: rgba(239,68,68,0.45); color: #fca5a5;">
-                🚪 Sign Out
+            <a href="/logout?sso=true" class="oidc-btn" style="border-color: rgba(239,68,68,0.45); color: #fca5a5;">
+                🚪 Sign Out (Keycloak SSO)
             </a>
             {% endif %}
         </div>
@@ -481,10 +484,14 @@
             const response = await fetch('/login/oidc', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username: username, password: 'password123', role: role, redirect_to: '/' })
+                body: JSON.stringify({ username: username, password: 'password', role: role, redirect_to: '/' })
             });
             if (response.ok) {
-                window.location.reload();
+                if (role !== 'admin' && role !== 'dev-admin') {
+                    window.location.href = '/?readonly_preview=true';
+                } else {
+                    window.location.href = '/';
+                }
             } else {
                 showBanner("⛔ Failed to switch OIDC profile.", true);
             }

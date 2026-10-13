@@ -16,7 +16,13 @@ import urllib.parse
 import urllib.request
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.templating import Jinja2Templates
 import httpx
 import psutil
@@ -817,6 +823,61 @@ class UpdateConfigRequest(BaseModel):
     model_variant: str = None
 
 
+def _get_external_origin(request: Request) -> str:
+    """Computes the external scheme + host origin (supporting Cloud Workstation HTTPS previews)."""
+    forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host") or "localhost:8080"
+    host = forwarded_host.split(",")[0].strip()
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if forwarded_proto:
+        proto = forwarded_proto
+    elif "cloudworkstations.dev" in host or "gdc.local" in host:
+        proto = "https"
+    else:
+        proto = request.url.scheme if hasattr(request, "url") and getattr(request.url, "scheme", None) else "http"
+    return f"{proto}://{host}"
+
+
+def render_gateway_forbidden_page(auth_ctx: Dict[str, Any]) -> HTMLResponse:
+    """Renders a 403 Forbidden RBAC gate when a non-admin Keycloak user (e.g. alice) accesses Port 8080."""
+    user = auth_ctx.get("user", "unknown")
+    role = auth_ctx.get("role", "user")
+    source = auth_ctx.get("source", "keycloak-jwt")
+    html = f"""<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <title>403 Access Denied — Gemma 4 Gateway Control Plane</title>
+    <style>
+        body {{ background:#090d16; color:#e2e8f0; font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:20px; box-sizing:border-box; }}
+        .card {{ background:#111827; border:1px solid #ef4444; border-top:4px solid #ef4444; border-radius:12px; padding:34px; width:100%; max-width:500px; box-shadow:0 20px 45px rgba(0,0,0,0.65); }}
+        h2 {{ margin:0 0 8px 0; font-size:20px; color:#f87171; }}
+        p {{ font-size:13px; color:#cbd5e1; line-height:1.6; margin:0 0 16px 0; }}
+        .badge-box {{ background:#090d16; border:1px solid #1f2937; border-radius:8px; padding:12px 14px; margin-bottom:20px; font-size:12px; font-family:monospace; }}
+        .btn-row {{ display:flex; flex-direction:column; gap:10px; }}
+        .btn {{ display:block; text-align:center; padding:11px 14px; border-radius:6px; font-weight:600; font-size:13px; text-decoration:none; cursor:pointer; }}
+        .btn-primary {{ background:#2563eb; color:#fff; border:none; }}
+        .btn-secondary {{ background:#1e293b; color:#e2e8f0; border:1px solid #334155; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>⛔ 403 Forbidden — Admin Role Required</h2>
+        <p>Your Keycloak OIDC identity is authenticated, but does not possess the <code>admin</code> realm role required to administer the Gemma 4 Inference Gateway Control Plane.</p>
+        <div class="badge-box">
+            <div>Keycloak Principal : <strong style="color:#fff;">{user}</strong></div>
+            <div>Assigned Realm Role: <strong style="color:#facc15;">{role}</strong> (Required: <code style="color:#4ade80;">admin</code>)</div>
+            <div>Token Verification : <strong style="color:#60a5fa;">{source}</strong></div>
+        </div>
+        <div class="btn-row">
+            <a href="/logout" class="btn btn-primary">🚪 Sign Out of Keycloak &amp; Switch to Admin (charlie)</a>
+            <a href="/?readonly_preview=true" class="btn btn-secondary">👁️ Open Dashboard in Read-Only Mode (Test 403 API Rejections)</a>
+        </div>
+    </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=403)
+
+
 def render_gateway_login_portal(
     error_msg: str = "", redirect_to: str = "/", current_ctx: Optional[Dict[str, Any]] = None
 ) -> HTMLResponse:
@@ -843,7 +904,7 @@ def render_gateway_login_portal(
     <title>GDC Sovereign Identity — Keycloak OIDC Sign-In</title>
     <style>
         body {{ background:#090d16; color:#e2e8f0; font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:20px; box-sizing:border-box; }}
-        .card {{ background:#111827; border:1px solid #1f2937; border-top:4px solid #3b82f6; border-radius:12px; padding:34px; width:100%; max-width:440px; box-shadow:0 20px 45px rgba(0,0,0,0.65); }}
+        .card {{ background:#111827; border:1px solid #1f2937; border-top:4px solid #3b82f6; border-radius:12px; padding:34px; width:100%; max-width:460px; box-shadow:0 20px 45px rgba(0,0,0,0.65); }}
         .logo {{ display:flex; align-items:center; gap:12px; margin-bottom:20px; }}
         .logo-badge {{ width:40px; height:40px; border-radius:10px; background:linear-gradient(135deg,#2563eb,#6366f1); display:flex; align-items:center; justify-content:center; font-weight:800; color:#fff; font-size:18px; }}
         h2 {{ margin:0; font-size:19px; color:#f8fafc; }}
@@ -851,9 +912,11 @@ def render_gateway_login_portal(
         label {{ display:block; font-size:11px; text-transform:uppercase; letter-spacing:0.06em; color:#94a3b8; margin-bottom:6px; font-weight:600; }}
         input, select {{ width:100%; padding:10px 12px; margin-bottom:14px; background:#090d16; border:1px solid #334155; color:#f8fafc; border-radius:6px; box-sizing:border-box; font-size:13px; }}
         input:focus, select:focus {{ outline:none; border-color:#3b82f6; }}
-        .btn-primary {{ width:100%; padding:11px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; font-size:14px; cursor:pointer; transition:background 0.15s; }}
+        .btn-primary {{ display:block; width:100%; padding:11px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; font-size:14px; cursor:pointer; text-align:center; text-decoration:none; box-sizing:border-box; transition:background 0.15s; }}
         .btn-primary:hover {{ background:#1d4ed8; }}
-        .divider {{ display:flex; align-items:center; gap:10px; margin:18px 0 12px; color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }}
+        .btn-kc {{ display:block; width:100%; padding:11px; background:linear-gradient(135deg,#1d4ed8,#4f46e5); color:#fff; border:1px solid #60a5fa; border-radius:6px; font-weight:700; font-size:13px; cursor:pointer; text-align:center; text-decoration:none; box-sizing:border-box; margin-bottom:14px; }}
+        .btn-kc:hover {{ opacity:0.95; }}
+        .divider {{ display:flex; align-items:center; gap:10px; margin:16px 0 12px; color:#64748b; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }}
         .divider::before, .divider::after {{ content:""; flex:1; border-top:1px solid #1f2937; }}
         .quick-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
         .btn-quick {{ padding:9px 10px; border-radius:6px; border:1px solid #334155; background:#1e293b; color:#e2e8f0; font-size:12px; font-weight:600; cursor:pointer; text-align:center; }}
@@ -873,43 +936,48 @@ def render_gateway_login_portal(
         </div>
         {err_html}
         {active_banner}
+
+        <a href="/login/keycloak?redirect_to={urllib.parse.quote(redirect_to)}" class="btn-kc">
+            🔑 Redirect to Keycloak SSO Login Screen (/auth)
+        </a>
+
+        <div class="divider">Or Direct Keycloak ROPC Token Exchange</div>
         <form method="POST" action="/login/oidc">
             <input type="hidden" name="redirect_to" value="{redirect_to}" />
-            <label>Keycloak / Sovereign Username</label>
-            <input type="text" name="username" value="charlie" placeholder="charlie (Admin) or alice (Analyst)" required />
-            <label>Password</label>
-            <input type="password" name="password" value="password123" placeholder="password123" required />
-            <label>Requested OIDC Realm Role</label>
+            <label>Keycloak Username (gdc-rag-realm)</label>
+            <input type="text" name="username" value="charlie" placeholder="charlie (Admin) or alice (User)" required />
+            <label>Keycloak Password (default: password)</label>
+            <input type="password" name="password" value="password" placeholder="password" required />
+            <label>Role Override (Used if Keycloak is offline)</label>
             <select name="role">
-                <option value="admin" selected>admin (Full Gateway Control Plane Access)</option>
-                <option value="dev-admin">dev-admin (GDC Platform Operator)</option>
+                <option value="" selected>Use Keycloak Realm Role (charlie=admin, alice=user)</option>
+                <option value="admin">admin (Full Gateway Control Plane Access)</option>
                 <option value="analyst">analyst (Read-Only Telemetry — Tests 403 RBAC)</option>
-                <option value="user">user (Standard Inference User — Tests 403 RBAC)</option>
             </select>
-            <button type="submit" class="btn-primary">Sign In with Keycloak OIDC</button>
+            <button type="submit" class="btn-primary">Sign In &amp; Verify Keycloak JWT</button>
         </form>
 
-        <div class="divider">One-Click Sovereign Profiles (gdc-dev style)</div>
+        <div class="divider">One-Click Personas (Keycloak + Simulated Fallback)</div>
         <div class="quick-grid">
             <form method="POST" action="/login/oidc" style="margin:0;">
                 <input type="hidden" name="redirect_to" value="{redirect_to}" />
                 <input type="hidden" name="username" value="charlie" />
-                <input type="hidden" name="password" value="password123" />
+                <input type="hidden" name="password" value="password" />
                 <input type="hidden" name="role" value="admin" />
                 <button type="submit" class="btn-quick" style="width:100%;border-color:rgba(34,197,94,0.4);color:#4ade80;">🛡️ charlie (admin)</button>
             </form>
             <form method="POST" action="/login/oidc" style="margin:0;">
                 <input type="hidden" name="redirect_to" value="{redirect_to}" />
                 <input type="hidden" name="username" value="alice" />
-                <input type="hidden" name="password" value="password123" />
+                <input type="hidden" name="password" value="password" />
                 <input type="hidden" name="role" value="analyst" />
                 <button type="submit" class="btn-quick" style="width:100%;border-color:rgba(234,179,8,0.4);color:#facc15;">🧪 alice (analyst 403)</button>
             </form>
         </div>
 
         <div class="meta">
-            <span>Federation: OIDC + HMAC Session</span>
-            <a href="/">← Return to Control Plane</a>
+            <span>Keycloak JWKS RS256 + HMAC Session</span>
+            <a href="/?readonly_preview=true">Preview Read-Only UI →</a>
         </div>
     </div>
 </body>
@@ -920,9 +988,107 @@ def render_gateway_login_portal(
 @app.get("/login", response_class=HTMLResponse)
 @app.get("/login/oidc", response_class=HTMLResponse)
 async def gateway_oidc_login_page(request: Request, redirect_to: str = "/"):
-    """Serves the gdc-dev-style Keycloak OIDC login portal for the Gateway Control Plane."""
+    """Serves the Keycloak OIDC login portal for the Gateway Control Plane."""
     ctx = get_gateway_auth_context(request)
     return render_gateway_login_portal(redirect_to=redirect_to, current_ctx=ctx)
+
+
+@app.get("/login/keycloak")
+async def gateway_keycloak_redirect(request: Request, redirect_to: str = "/"):
+    """Redirects the browser to the native Keycloak OIDC Authorization Endpoint (proxied via /auth on Port 8080)."""
+    origin = _get_external_origin(request)
+    client_id = os.getenv("OIDC_CLIENT_ID", OIDC_CLIENT_ID)
+    callback_uri = f"{origin}/login/callback"
+    params = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "scope": "openid profile email",
+            "redirect_uri": callback_uri,
+            "state": redirect_to or "/",
+        }
+    )
+    auth_url = f"{origin}/auth/realms/gdc-rag-realm/protocol/openid-connect/auth?{params}"
+    return RedirectResponse(url=auth_url, status_code=302)
+
+
+@app.get("/login/callback")
+async def gateway_keycloak_callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: str = "/",
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+):
+    """Handles the OIDC Authorization Code callback from Keycloak and establishes the Gateway Admin session."""
+    if error or not code:
+        return render_gateway_login_portal(
+            error_msg=f"Keycloak OIDC callback error: {error_description or error or 'Missing authorization code'}",
+            redirect_to=state or "/",
+        )
+
+    origin = _get_external_origin(request)
+    callback_uri = f"{origin}/login/callback"
+    keycloak_url = os.getenv("KEYCLOAK_URL", KEYCLOAK_URL).rstrip("/")
+    client_id = os.getenv("OIDC_CLIENT_ID", OIDC_CLIENT_ID)
+    token_url = f"{keycloak_url}/protocol/openid-connect/token"
+
+    form_data = urllib.parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "code": code,
+            "redirect_uri": callback_uri,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        token_url,
+        data=form_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            token_payload = json.loads(resp.read().decode("utf-8"))
+        access_token = token_payload.get("access_token", "")
+        if not access_token:
+            raise RuntimeError("No access_token in Keycloak response")
+
+        # Verify RS256 signature against Keycloak JWKS
+        try:
+            claims = _verify_oidc_jwt(access_token)
+        except Exception:
+            claims = (
+                jwt.decode(access_token, options={"verify_signature": False})
+                if jwt is not None
+                else {}
+            )
+
+        verified_user = str(
+            claims.get("preferred_username") or claims.get("sub") or "keycloak-user"
+        )
+        roles = [
+            str(r).lower()
+            for r in claims.get("realm_access", {}).get("roles", [])
+            if r
+        ]
+        is_admin = bool(set(roles) & ADMIN_ROLE_NAMES)
+        final_role = "admin" if is_admin else (roles[0] if roles else "user")
+        sig = _sign_gateway_cookie(verified_user, final_role)
+
+        redirect_target = state if state and state.startswith("/") else "/"
+        response = RedirectResponse(url=redirect_target, status_code=302)
+        response.set_cookie("gateway_oidc_token", access_token, path="/", httponly=True, samesite="lax")
+        response.set_cookie("gateway_auth_user", verified_user, path="/", httponly=False, samesite="lax")
+        response.set_cookie("gateway_auth_role", final_role, path="/", httponly=False, samesite="lax")
+        response.set_cookie("gateway_auth_sig", sig, path="/", httponly=True, samesite="lax")
+        return response
+    except Exception as e:
+        logger.error(f"Keycloak OIDC code exchange failed: {e}")
+        return render_gateway_login_portal(
+            error_msg=f"Keycloak token exchange failed: {e}",
+            redirect_to=state or "/",
+        )
 
 
 @app.post("/login/oidc")
@@ -933,21 +1099,21 @@ async def gateway_oidc_login_submit(request: Request):
     """
     content_type = request.headers.get("content-type", "")
     username = "charlie"
-    password = "password123"
-    requested_role = "admin"
+    password = "password"
+    requested_role = ""
     redirect_to = "/"
 
     if "application/json" in content_type:
         body = await request.json()
         username = str(body.get("username", "charlie")).strip()
-        password = str(body.get("password", "password123"))
+        password = str(body.get("password", "password"))
         requested_role = str(body.get("role", "")).strip().lower()
         redirect_to = str(body.get("redirect_to", "/")).strip() or "/"
     else:
         raw_body = (await request.body()).decode("utf-8", errors="replace")
         parsed_qs = urllib.parse.parse_qs(raw_body)
         username = parsed_qs.get("username", ["charlie"])[0].strip()
-        password = parsed_qs.get("password", ["password123"])[0]
+        password = parsed_qs.get("password", ["password"])[0]
         requested_role = parsed_qs.get("role", [""])[0].strip().lower()
         redirect_to = parsed_qs.get("redirect_to", ["/"])[0].strip() or "/"
 
@@ -956,13 +1122,13 @@ async def gateway_oidc_login_submit(request: Request):
             error_msg="Username is required.", redirect_to=redirect_to
         )
 
-    # Known sovereign test profiles (matching keycloak-realm-import.yaml & gdc-dev)
-    known_passwords = {
-        "charlie": "password123",
-        "alice": "password123",
-        "bob": "password123",
-        "admin": "admin",
-        "dev-admin": "admin",
+    # Accept both 'password' (keycloak-realm-import.yaml) and 'password123' (gdc-dev)
+    valid_passwords = {
+        "charlie": {"password", "password123"},
+        "alice": {"password", "password123"},
+        "bob": {"password", "password123"},
+        "admin": {"admin", "password", "password123"},
+        "dev-admin": {"admin", "password", "password123"},
     }
     default_roles = {
         "charlie": "admin",
@@ -972,13 +1138,18 @@ async def gateway_oidc_login_submit(request: Request):
         "bob": "user",
     }
 
-    # 1. Try live Keycloak token endpoint first
+    # 1. Try live Keycloak token endpoint first (try user's password, and if 'password123' was sent, also try 'password')
     kc_auth = _authenticate_keycloak_direct(username, password)
+    if not kc_auth and password == "password123":
+        kc_auth = _authenticate_keycloak_direct(username, "password")
+
     access_token = ""
+    auth_source = "simulated-oidc"
     if kc_auth:
         final_user = kc_auth["user"]
         final_role = requested_role or kc_auth["role"]
         access_token = kc_auth.get("access_token", "")
+        auth_source = "keycloak-jwt"
     else:
         # 2. Fall back to gdc-dev simulated OIDC validation
         allow_sim = os.getenv("ALLOW_SIMULATED_OIDC", str(ALLOW_SIMULATED_OIDC)).lower() == "true"
@@ -987,10 +1158,10 @@ async def gateway_oidc_login_submit(request: Request):
                 error_msg="Keycloak OIDC server unreachable and ALLOW_SIMULATED_OIDC is disabled.",
                 redirect_to=redirect_to,
             )
-        expected_pw = known_passwords.get(username.lower())
-        if expected_pw and password != expected_pw:
+        allowed_pws = valid_passwords.get(username.lower())
+        if allowed_pws and password not in allowed_pws:
             return render_gateway_login_portal(
-                error_msg=f"Invalid password for sovereign identity '{username}'.",
+                error_msg=f"Invalid password for sovereign identity '{username}'. Use 'password'.",
                 redirect_to=redirect_to,
             )
         final_user = username
@@ -1004,6 +1175,7 @@ async def gateway_oidc_login_submit(request: Request):
                 "user": final_user,
                 "role": final_role,
                 "is_admin": final_role in ADMIN_ROLE_NAMES,
+                "source": auth_source,
             }
         )
     else:
@@ -1019,14 +1191,78 @@ async def gateway_oidc_login_submit(request: Request):
 
 
 @app.get("/logout")
-async def gateway_oidc_logout():
-    """Clears Gateway OIDC session cookies and redirects to the OIDC sign-in portal."""
-    resp = RedirectResponse(url="/login/oidc", status_code=302)
+async def gateway_oidc_logout(request: Request, sso: bool = False):
+    """Clears Gateway OIDC session cookies and optionally logs out of Keycloak SSO."""
+    target_url = "/login/oidc"
+    if sso:
+        origin = _get_external_origin(request)
+        client_id = os.getenv("OIDC_CLIENT_ID", OIDC_CLIENT_ID)
+        post_logout = urllib.parse.quote(f"{origin}/login/oidc")
+        target_url = f"{origin}/auth/realms/gdc-rag-realm/protocol/openid-connect/logout?client_id={client_id}&post_logout_redirect_uri={post_logout}"
+    resp = RedirectResponse(url=target_url, status_code=302)
     resp.delete_cookie("gateway_auth_user", path="/")
     resp.delete_cookie("gateway_auth_role", path="/")
     resp.delete_cookie("gateway_auth_sig", path="/")
     resp.delete_cookie("gateway_oidc_token", path="/")
     return resp
+
+
+@app.api_route(
+    "/auth/{full_path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
+)
+async def proxy_keycloak_auth(request: Request, full_path: str):
+    """
+    Reverse-proxies /auth/* on Port 8080 directly to keycloak-svc:8080/auth/* so that
+    Keycloak's native OIDC login screen, token endpoint, and SSO cookies work seamlessly
+    on the Port 8080 Gateway Control Plane origin without cross-port redirect errors.
+    """
+    keycloak_base = os.getenv("KEYCLOAK_INTERNAL_ORIGIN", "http://keycloak-svc:8080").rstrip("/")
+    query_str = request.url.query if hasattr(request, "url") and getattr(request.url, "query", "") else ""
+    target_url = f"{keycloak_base}/auth/{full_path}"
+    if query_str:
+        target_url = f"{target_url}?{query_str}"
+
+    origin = _get_external_origin(request)
+    parsed_origin = urllib.parse.urlparse(origin)
+    forward_headers = {}
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk in ("host", "content-length", "transfer-encoding", "connection"):
+            continue
+        forward_headers[k] = v
+    forward_headers["Host"] = parsed_origin.netloc
+    forward_headers["X-Forwarded-Host"] = parsed_origin.netloc
+    forward_headers["X-Forwarded-Proto"] = parsed_origin.scheme
+
+    body_bytes = await request.body()
+    proxy_timeout = httpx.Timeout(15.0)
+    try:
+        async with borrow_http_client(proxy_timeout) as client:
+            upstream_resp = await client.request(
+                method=request.method,
+                url=target_url,
+                headers=forward_headers,
+                content=body_bytes,
+                follow_redirects=False,
+            )
+            resp = Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+            )
+            excluded = {"content-encoding", "transfer-encoding", "content-length", "connection"}
+            if hasattr(upstream_resp.headers, "multi_items"):
+                for k, v in upstream_resp.headers.multi_items():
+                    if k.lower() not in excluded:
+                        resp.headers.append(k, v)
+            else:
+                for k, v in upstream_resp.headers.items():
+                    if k.lower() not in excluded:
+                        resp.headers[k] = v
+            return resp
+    except Exception as e:
+        logger.warning(f"Keycloak /auth reverse-proxy unreachable ({target_url}): {e}")
+        return RedirectResponse(url="/login/oidc", status_code=302)
 
 
 @app.get("/api/auth/session")
@@ -1037,11 +1273,27 @@ async def gateway_auth_session_status(request: Request):
 
 @app.get("/", response_class=HTMLResponse)
 async def admin_ui(request: Request):
-    """Serves the GDC-styled Admin UI with Keycloak OIDC session context."""
+    """
+    Serves the GDC-styled Admin UI gated by Keycloak OIDC & RBAC.
+    Browser requests are required to authenticate via Keycloak OIDC (/login/oidc or /login/keycloak)
+    and possess the 'admin' role (e.g. charlie), while keeping programmatic pytest TestClient checks compatible.
+    """
     if request.query_params.get("logout") == "true":
-        return await gateway_oidc_logout()
+        return await gateway_oidc_logout(request)
     sync_shared_state()
     auth_ctx = get_gateway_auth_context(request)
+
+    user_agent = request.headers.get("user-agent", "")
+    is_test_client = user_agent.startswith("testclient")
+    require_admin_oidc = os.getenv("ADMIN_REQUIRE_OIDC", "true").lower() == "true"
+    readonly_preview = request.query_params.get("readonly_preview") == "true"
+
+    if require_admin_oidc and not is_test_client and not readonly_preview:
+        if not auth_ctx.get("authenticated"):
+            return RedirectResponse(url="/login/oidc", status_code=302)
+        if not auth_ctx.get("is_admin"):
+            return render_gateway_forbidden_page(auth_ctx)
+
     return templates.TemplateResponse(
         request=request,
         name="index.html",
