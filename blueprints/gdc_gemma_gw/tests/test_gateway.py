@@ -494,4 +494,141 @@ def test_prompt_routing_classifier_history_does_not_stick(monkeypatch):
     assert called_json["model"] == "gemma4:26b"
 
 
+def test_vllm_prometheus_metrics_scraping(monkeypatch):
+    """Verify /api/metrics scrapes real vLLM Prometheus metrics instead of random numbers."""
+    monkeypatch.setattr(main, "ACTIVE_FRAMEWORK", "vllm")
+    monkeypatch.setattr(main, "MODEL_ROUTING_CONFIG", {
+        "gemma4:26b": "http://vllm-26b-service:8000",
+        "gemma4:31b": "http://vllm-31b-service:8000",
+    })
+    monkeypatch.setenv("GPU_VRAM_TOTAL_GB", "80.0")
+    monkeypatch.setenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")
+
+    sample_prometheus_text = """
+# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage.
+# TYPE vllm:gpu_cache_usage_perc gauge
+vllm:gpu_cache_usage_perc{model_name="gemma4:26b"} 0.42
+# HELP vllm:num_requests_running Number of requests currently running on GPU.
+# TYPE vllm:num_requests_running gauge
+vllm:gpu_cache_usage_perc{model_name="gemma4:31b"} 0.18
+vllm:num_requests_running{model_name="gemma4:26b"} 3
+vllm:num_requests_waiting{model_name="gemma4:26b"} 1
+vllm:avg_generation_throughput_toks_per_s{model_name="gemma4:26b"} 64.5
+"""
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    mock_metrics_resp = MagicMock()
+    mock_metrics_resp.status_code = 200
+    mock_metrics_resp.text = sample_prometheus_text
+    mock_client.get = AsyncMock(return_value=mock_metrics_resp)
+
+    monkeypatch.setattr("httpx.AsyncClient", MagicMock(return_value=mock_client))
+
+    response = client.get("/api/metrics")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["telemetry_source"] == "vllm_prometheus"
+    assert data["vram_total_gb"] == 80.0
+    assert data["vram_used_gb"] == 72.0
+    assert data["kv_cache_usage_percent"] == 30.0
+    assert data["vllm_requests_running"] == 6
+    assert data["vllm_requests_waiting"] == 2
+    assert data["request_throughput"] == 129.0
+
+
+def test_shared_state_file_persistence_across_replicas(monkeypatch, tmp_path):
+    """Verify that GATEWAY_STATE_FILE synchronizes config, blocklists, and sessions across replicas."""
+    state_file = tmp_path / "gateway_state.json"
+    monkeypatch.setenv("GATEWAY_STATE_FILE", str(state_file))
+
+    # Replica 1 updates config and blocks a user
+    res_cfg = client.post("/api/config", json={"temperature": 0.35, "model_variant": "31b"})
+    assert res_cfg.status_code == 200
+    res_blk = client.post("/api/users/replica-blocked-user/block", json={"blocked": True})
+    assert res_blk.status_code == 200
+    assert state_file.exists()
+
+    # Simulate Replica 2 with fresh in-memory globals reading from the shared state file
+    main.CURRENT_STATE["temperature"] = 0.9
+    main.CURRENT_STATE["model_variant"] = "26b"
+    main.BLOCKED_USERS.clear()
+
+    res_get_cfg = client.get("/api/config")
+    assert res_get_cfg.status_code == 200
+    assert res_get_cfg.json()["temperature"] == 0.35
+    assert res_get_cfg.json()["model_variant"] == "31b"
+    assert "replica-blocked-user" in client.get("/api/users/blocked").json()
+
+
+def test_shared_http_client_connection_pooling():
+    """Verify get_shared_http_client reuses a single persistent AsyncClient instance."""
+    import httpx as real_httpx
+    t1 = real_httpx.Timeout(30.0)
+    t2 = real_httpx.Timeout(60.0)
+    c1 = main.get_shared_http_client(t1)
+    c2 = main.get_shared_http_client(t2)
+    assert c1 is c2
+    assert c2.timeout == t2
+
+
+def test_prompt_classifier_word_boundaries_and_structural_signals():
+    """Verify benign idioms do not false-positive to 31B while structural code/SQL/headers route to 31B."""
+    main.CURRENT_STATE["model_variant"] = "26b"
+
+    # Benign conversational prompt containing substring traps ('reason', 'code', 'program')
+    benign_payload = {
+        "messages": [
+            {"role": "user", "content": "For some reason my zip code and loyalty program card are missing."}
+        ]
+    }
+    assert main.classify_prompt_complexity(benign_payload) == "gemma4:26b"
+
+    # Structural fenced code block without explicit keyword
+    fenced_payload = {
+        "messages": [
+            {"role": "user", "content": "Review this:\n```yaml\napiVersion: v1\nkind: Pod\n```"}
+        ]
+    }
+    assert main.classify_prompt_complexity(fenced_payload) == "gemma4:31b"
+
+    # Explicit X-Task-Complexity header from upstream IDE Swarm persona
+    simple_payload = {"messages": [{"role": "user", "content": "Hello"}]}
+    assert main.classify_prompt_complexity(simple_payload, {"X-Task-Complexity": "high"}) == "gemma4:31b"
+
+
+def test_keycloak_oidc_jwt_verification_and_spoof_prevention(monkeypatch):
+    """Verify that when ENABLE_OIDC=true, JWT claims override spoofed X-User-ID headers."""
+    monkeypatch.setenv("ENABLE_OIDC", "true")
+    monkeypatch.setattr(main, "ACTIVE_FRAMEWORK", "ollama")
+    monkeypatch.setattr(main, "MODEL_ROUTING_CONFIG", {"*": "http://ollama-26b-service:11434"})
+
+    # 1. Missing Bearer token -> 401
+    unauth_resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+    )
+    assert unauth_resp.status_code == 401
+
+    # 2. Valid OIDC JWT where verified user ('blocked-oidc-user') attempts to spoof X-User-ID='innocent-user'
+    monkeypatch.setattr(
+        main,
+        "_verify_oidc_jwt",
+        lambda token: {"preferred_username": "blocked-oidc-user", "realm_access": {"roles": ["user"]}},
+    )
+    main.BLOCKED_USERS = {"blocked-oidc-user"}
+
+    spoof_resp = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer mock-valid-jwt", "X-User-ID": "innocent-user"},
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+    )
+    assert spoof_resp.status_code == 403
+    assert "User has been administratively blocked" in spoof_resp.json()["detail"]
+    main.BLOCKED_USERS.clear()
+
+
+
 

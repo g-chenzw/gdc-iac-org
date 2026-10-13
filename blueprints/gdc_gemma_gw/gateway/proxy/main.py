@@ -1,78 +1,474 @@
-import os
-import json
-import httpx
-import random
-import psutil
+from contextlib import asynccontextmanager
 from datetime import datetime
+import fcntl
 import hmac
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends
-from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
-from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+import json
 import logging
+import os
+import re
+import socket
+import tempfile
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
+import urllib.request
+
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.templating import Jinja2Templates
+import httpx
+import psutil
+from pydantic import BaseModel
+
+try:
+    import jwt
+    from jwt import PyJWKSet
+    from jwt.exceptions import PyJWTError as JWTError
+except ImportError:  # pragma: no cover - optional in minimal test environments
+    jwt = None
+    PyJWKSet = None
+    JWTError = Exception
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gemma-gateway")
 
-app = FastAPI(title="Gemma 4 Inference Gateway (GDC-ag)")
+# Preserve original httpx.AsyncClient reference so we can detect test monkeypatching
+_REAL_ASYNC_CLIENT_CLS = httpx.AsyncClient
+_SHARED_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
-# Telemetry and Session State registries
+# Telemetry and Session State registries (synchronized across workers/replicas when state store is active)
 ACTIVE_COMPLETIONS_COUNT = 0
-ACTIVE_SESSIONS = {}
-BLOCKED_USERS = set()
+ACTIVE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+BLOCKED_USERS: Set[str] = set()
 
-# Optional API and Admin authentication tokens (enforced when set in environment)
+# Sliding-window token/request counters for deterministic gateway throughput telemetry
+_TOKEN_COMPLETION_HISTORY: List[Tuple[float, int]] = []
+_LAST_VLLM_GEN_TOKENS: Dict[str, Tuple[float, float]] = {}
+
+# Optional API, Admin, and Keycloak OIDC authentication configuration
 GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
 GATEWAY_ADMIN_TOKEN = os.getenv("GATEWAY_ADMIN_TOKEN", "")
-
-
-def verify_api_auth(request: Request):
-    expected = os.getenv("GATEWAY_API_KEY", GATEWAY_API_KEY)
-    if not expected:
-        return
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header.split(" ", 1)[1].strip() if auth_header.startswith("Bearer ") else request.headers.get("X-API-Key", "").strip()
-    if not token or not hmac.compare_digest(token, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized gateway API request")
-
-
-def verify_admin_auth(request: Request):
-    expected = os.getenv("GATEWAY_ADMIN_TOKEN", GATEWAY_ADMIN_TOKEN) or os.getenv("GATEWAY_API_KEY", GATEWAY_API_KEY)
-    if not expected:
-        return
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header.split(" ", 1)[1].strip() if auth_header.startswith("Bearer ") else request.headers.get("X-Admin-Token", "").strip()
-    if not token or not hmac.compare_digest(token, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized gateway admin request")
-
+ENABLE_OIDC = os.getenv("ENABLE_OIDC", "false").lower() == "true"
+KEYCLOAK_URL = os.getenv(
+    "KEYCLOAK_URL", "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
+)
+OIDC_ALGORITHMS = ["RS256"]
+_JWKS_CACHE: Optional[Dict[str, Any]] = None
 
 # Configuration
 # 'ollama' or 'vllm' - strictly defined for this instance. Do not switch at runtime.
-ACTIVE_FRAMEWORK = os.getenv("ACTIVE_FRAMEWORK", "ollama") 
+ACTIVE_FRAMEWORK = os.getenv("ACTIVE_FRAMEWORK", "ollama")
 # Active variant loaded on the Ollama backend ('26b' or '31b')
 OLLAMA_MODEL_VARIANT = os.getenv("OLLAMA_MODEL_VARIANT", "26b")
 
-# Routing table for models. 
+# Routing table for models.
 # For Ollama, we map specific tags to their standalone variant services.
 # For vLLM, we route different model tags to their GPU serving nodes.
-DEFAULT_ROUTING = '{"gemma4:26b": "http://ollama-26b-service:11434", "gemma4:31b": "http://ollama-31b-service:11434", "*": "http://ollama-26b-service:11434"}' if ACTIVE_FRAMEWORK == "ollama" else '{"gemma4:26b": "http://vllm-26b-vllm-gke-service:8000", "gemma4:31b": "http://vllm-31b-vllm-gke-service:8000", "*": "http://vllm-26b-vllm-gke-service:8000"}'
-MODEL_ROUTING_CONFIG = json.loads(os.getenv("MODEL_ROUTING_CONFIG", DEFAULT_ROUTING))
+DEFAULT_ROUTING = (
+    '{"gemma4:26b": "http://ollama-26b-service:11434", "gemma4:31b": "http://ollama-31b-service:11434", "*": "http://ollama-26b-service:11434"}'
+    if ACTIVE_FRAMEWORK == "ollama"
+    else '{"gemma4:26b": "http://vllm-26b-vllm-gke-service:8000", "gemma4:31b": "http://vllm-31b-vllm-gke-service:8000", "*": "http://vllm-26b-vllm-gke-service:8000"}'
+)
+MODEL_ROUTING_CONFIG: Dict[str, str] = json.loads(
+    os.getenv("MODEL_ROUTING_CONFIG", DEFAULT_ROUTING)
+)
 
 # Current generation state
-CURRENT_STATE = {
+CURRENT_STATE: Dict[str, Any] = {
     "temperature": 0.7,
     "top_p": 0.9,
     "frequency_penalty": 0.0,
-    "vision_token_budget": 280, # Gemma 4 specific token budget
-    "model_variant": os.getenv("OLLAMA_MODEL_VARIANT", "26b") # Hot-swappable variant
+    "vision_token_budget": 280,  # Gemma 4 specific token budget
+    "model_variant": os.getenv("OLLAMA_MODEL_VARIANT", "26b"),  # Hot-swappable variant
 }
 
 # System role capability register and payload message flattener
 # To prevent vLLM from throwing 400 Bad Request 'System role not supported'
 # when running GKE sandboxed mock environments (using google/gemma-2b-it).
-UNSUPPORTED_SYSTEM_ROLE_MODELS = set()
+UNSUPPORTED_SYSTEM_ROLE_MODELS: Set[str] = set()
+
+
+# =====================================================================
+# Shared Multi-Replica State Persistence (Redis RESP2 / Atomic File Store)
+# =====================================================================
+REDIS_URL = os.getenv("REDIS_URL", "")
+GATEWAY_STATE_FILE = os.getenv("GATEWAY_STATE_FILE", "")
+_REDIS_STATE_KEY = os.getenv("GATEWAY_STATE_KEY", "gdc:gemma_gateway:state")
+
+
+def _parse_redis_url(url: str) -> Optional[Tuple[str, int, Optional[str]]]:
+    """Parses redis://[:password@]host[:port][/db] without requiring third-party libraries."""
+    if not url or not url.startswith("redis://"):
+        return None
+    stripped = url[len("redis://") :].split("/", 1)[0]
+    password = None
+    if "@" in stripped:
+        auth_part, host_part = stripped.rsplit("@", 1)
+        password = auth_part.split(":", 1)[1] if ":" in auth_part else auth_part
+    else:
+        host_part = stripped
+    if ":" in host_part:
+        host, port_str = host_part.rsplit(":", 1)
+        return host, int(port_str), password
+    return host_part, 6379, password
+
+
+def _redis_resp_command(
+    host: str, port: int, args: List[str], password: Optional[str] = None
+) -> Optional[str]:
+    """Executes a minimal Redis RESP2 command over a short-lived socket."""
+    def _encode_cmd(parts: List[str]) -> bytes:
+        buf = [f"*{len(parts)}\r\n".encode("utf-8")]
+        for part in parts:
+            encoded = part.encode("utf-8")
+            buf.append(f"${len(encoded)}\r\n".encode("utf-8") + encoded + b"\r\n")
+        return b"".join(buf)
+
+    def _read_resp(sock_file) -> Optional[str]:
+        line = sock_file.readline()
+        if not line:
+            return None
+        prefix = chr(line[0])
+        payload = line[1:].rstrip(b"\r\n")
+        if prefix == "+":
+            return payload.decode("utf-8", errors="replace")
+        if prefix == "-":
+            raise RuntimeError(payload.decode("utf-8", errors="replace"))
+        if prefix == ":":
+            return payload.decode("utf-8", errors="replace")
+        if prefix == "$":
+            length = int(payload)
+            if length < 0:
+                return None
+            data = sock_file.read(length)
+            sock_file.read(2)  # trailing CRLF
+            return data.decode("utf-8", errors="replace")
+        return None
+
+    with socket.create_connection((host, port), timeout=1.5) as sock:
+        with sock.makefile("rwb") as sock_file:
+            if password:
+                sock_file.write(_encode_cmd(["AUTH", password]))
+                sock_file.flush()
+                _read_resp(sock_file)
+            sock_file.write(_encode_cmd(args))
+            sock_file.flush()
+            return _read_resp(sock_file)
+
+
+def persist_shared_state() -> None:
+    """Persists gateway configuration, sessions, and blocklists to Redis or an atomic state file."""
+    redis_url = os.getenv("REDIS_URL", REDIS_URL)
+    state_file = os.getenv("GATEWAY_STATE_FILE", GATEWAY_STATE_FILE)
+    if not redis_url and not state_file:
+        return
+
+    snapshot = {
+        "current_state": CURRENT_STATE,
+        "active_sessions": ACTIVE_SESSIONS,
+        "blocked_users": sorted(list(BLOCKED_USERS)),
+        "unsupported_system_role_models": sorted(list(UNSUPPORTED_SYSTEM_ROLE_MODELS)),
+    }
+    serialized = json.dumps(snapshot)
+
+    if redis_url:
+        parsed = _parse_redis_url(redis_url)
+        if parsed:
+            host, port, password = parsed
+            try:
+                _redis_resp_command(
+                    host, port, ["SET", _REDIS_STATE_KEY, serialized], password=password
+                )
+            except Exception as e:
+                logger.warning(f"Failed to persist gateway state to Redis ({host}:{port}): {e}")
+
+    if state_file:
+        try:
+            parent_dir = os.path.dirname(os.path.abspath(state_file))
+            os.makedirs(parent_dir, exist_ok=True)
+            lock_path = f"{state_file}.lock"
+            with open(lock_path, "w", encoding="utf-8") as lock_fp:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+                try:
+                    fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix=".gw_state_")
+                    with os.fdopen(fd, "w", encoding="utf-8") as tmp_fp:
+                        tmp_fp.write(serialized)
+                        tmp_fp.flush()
+                        os.fsync(tmp_fp.fileno())
+                    os.replace(tmp_path, state_file)
+                finally:
+                    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+        except Exception as e:
+            logger.warning(f"Failed to persist gateway state to file ({state_file}): {e}")
+
+
+def sync_shared_state() -> None:
+    """Synchronizes in-memory state from Redis or the shared state file when configured."""
+    redis_url = os.getenv("REDIS_URL", REDIS_URL)
+    state_file = os.getenv("GATEWAY_STATE_FILE", GATEWAY_STATE_FILE)
+    if not redis_url and not state_file:
+        return
+
+    raw_json: Optional[str] = None
+    if redis_url:
+        parsed = _parse_redis_url(redis_url)
+        if parsed:
+            host, port, password = parsed
+            try:
+                raw_json = _redis_resp_command(
+                    host, port, ["GET", _REDIS_STATE_KEY], password=password
+                )
+            except Exception as e:
+                logger.warning(f"Failed to read gateway state from Redis ({host}:{port}): {e}")
+
+    if raw_json is None and state_file and os.path.exists(state_file):
+        try:
+            lock_path = f"{state_file}.lock"
+            with open(lock_path, "w", encoding="utf-8") as lock_fp:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_SH)
+                try:
+                    with open(state_file, "r", encoding="utf-8") as fp:
+                        raw_json = fp.read()
+                finally:
+                    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+        except Exception as e:
+            logger.warning(f"Failed to read gateway state from file ({state_file}): {e}")
+
+    if not raw_json:
+        return
+
+    try:
+        data = json.loads(raw_json)
+        if isinstance(data.get("current_state"), dict):
+            CURRENT_STATE.update(data["current_state"])
+        if isinstance(data.get("active_sessions"), dict):
+            ACTIVE_SESSIONS.clear()
+            ACTIVE_SESSIONS.update(data["active_sessions"])
+        if isinstance(data.get("blocked_users"), list):
+            BLOCKED_USERS.clear()
+            BLOCKED_USERS.update(data["blocked_users"])
+        if isinstance(data.get("unsupported_system_role_models"), list):
+            UNSUPPORTED_SYSTEM_ROLE_MODELS.clear()
+            UNSUPPORTED_SYSTEM_ROLE_MODELS.update(data["unsupported_system_role_models"])
+    except Exception as e:
+        logger.warning(f"Failed to decode shared gateway state: {e}")
+
+
+# =====================================================================
+# Shared HTTPX Connection Pool Management
+# =====================================================================
+def get_shared_http_client(timeout: httpx.Timeout) -> httpx.AsyncClient:
+    """Returns or lazily initializes the persistent connection-pooled AsyncClient."""
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is None or _SHARED_HTTP_CLIENT.is_closed:
+        limits = httpx.Limits(
+            max_keepalive_connections=int(os.getenv("HTTP_MAX_KEEPALIVE", "50")),
+            max_connections=int(os.getenv("HTTP_MAX_CONNECTIONS", "200")),
+            keepalive_expiry=60.0,
+        )
+        _SHARED_HTTP_CLIENT = _REAL_ASYNC_CLIENT_CLS(
+            timeout=timeout,
+            limits=limits,
+            trust_env=False,
+        )
+    else:
+        _SHARED_HTTP_CLIENT.timeout = timeout
+    return _SHARED_HTTP_CLIENT
+
+
+async def close_shared_http_client() -> None:
+    """Cleanly closes the shared HTTPX connection pool on application shutdown."""
+    global _SHARED_HTTP_CLIENT
+    if _SHARED_HTTP_CLIENT is not None and not _SHARED_HTTP_CLIENT.is_closed:
+        await _SHARED_HTTP_CLIENT.aclose()
+        _SHARED_HTTP_CLIENT = None
+
+
+@asynccontextmanager
+async def borrow_http_client(timeout: httpx.Timeout):
+    """
+    Yields a pooled httpx.AsyncClient in production, while transparently supporting
+    per-request monkeypatched httpx.AsyncClient mocks in unit tests.
+    """
+    if httpx.AsyncClient is not _REAL_ASYNC_CLIENT_CLS:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as mocked_client:
+            yield mocked_client
+    else:
+        yield get_shared_http_client(timeout)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    sync_shared_state()
+    yield
+    await close_shared_http_client()
+
+
+app = FastAPI(title="Gemma 4 Inference Gateway (GDC-ag)", lifespan=lifespan)
+
+
+# =====================================================================
+# Authentication & Keycloak OIDC Federation
+# =====================================================================
+def _get_keycloak_jwks() -> Optional[Dict[str, Any]]:
+    """Fetches and caches public verification keys from the configured Keycloak realm."""
+    global _JWKS_CACHE
+    enable_oidc = os.getenv("ENABLE_OIDC", str(ENABLE_OIDC)).lower() == "true"
+    keycloak_url = os.getenv("KEYCLOAK_URL", KEYCLOAK_URL)
+    if _JWKS_CACHE is None and enable_oidc:
+        try:
+            certs_url = f"{keycloak_url.rstrip('/')}/protocol/openid-connect/certs"
+            with urllib.request.urlopen(certs_url, timeout=5) as response:
+                _JWKS_CACHE = json.loads(response.read().decode("utf-8"))
+                logger.info("OIDC: Loaded JWKS verification keys from Keycloak")
+        except Exception as e:
+            logger.error(f"OIDC: Failed to fetch JWKS certificates from {keycloak_url}: {e}")
+    return _JWKS_CACHE
+
+
+def _verify_oidc_jwt(token: str) -> Dict[str, Any]:
+    """Verifies a Keycloak RS256 Bearer JWT and returns its decoded claims."""
+    global _JWKS_CACHE
+    if jwt is None or PyJWKSet is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PyJWT with crypto support is required when ENABLE_OIDC=true",
+        )
+    jwks = _get_keycloak_jwks()
+    if not jwks:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Keycloak OIDC JWKS endpoint is unreachable",
+        )
+    try:
+        signing_key = jwks
+        if isinstance(jwks, dict) and "keys" in jwks:
+            unverified_header = jwt.get_unverified_header(token)
+            kid = unverified_header.get("kid")
+            jwk_set = PyJWKSet.from_dict(jwks)
+            if kid:
+                try:
+                    signing_key = jwk_set[kid].key
+                except KeyError:
+                    _JWKS_CACHE = None
+                    refreshed = _get_keycloak_jwks()
+                    if refreshed and isinstance(refreshed, dict) and "keys" in refreshed:
+                        signing_key = PyJWKSet.from_dict(refreshed)[kid].key
+                    else:
+                        raise JWTError(f"Signing key ID '{kid}' not found in JWKS")
+            elif jwk_set.keys:
+                signing_key = jwk_set.keys[0].key
+            else:
+                raise JWTError("No signing keys present in JWKS")
+
+        return jwt.decode(
+            token,
+            signing_key,
+            algorithms=OIDC_ALGORITHMS,
+            leeway=300,
+            options={"verify_aud": False},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"OIDC JWT verification failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid OIDC bearer token: {e}",
+        )
+
+
+def verify_api_auth(request: Request) -> None:
+    """
+    Validates API requests using either Keycloak OIDC JWT (when ENABLE_OIDC=true)
+    or GATEWAY_API_KEY (when configured). Stores verified identity on request.state.
+    """
+    enable_oidc = os.getenv("ENABLE_OIDC", str(ENABLE_OIDC)).lower() == "true"
+    expected_api_key = os.getenv("GATEWAY_API_KEY", GATEWAY_API_KEY)
+    auth_header = request.headers.get("Authorization", "")
+    bearer_token = (
+        auth_header.split(" ", 1)[1].strip()
+        if auth_header.startswith("Bearer ")
+        else ""
+    )
+    api_key_header = request.headers.get("X-API-Key", "").strip()
+
+    # 1. If a static GATEWAY_API_KEY is configured and matches, allow trusted backend call
+    if expected_api_key:
+        candidate_key = api_key_header or bearer_token
+        if candidate_key and hmac.compare_digest(candidate_key, expected_api_key):
+            request.state.verified_user_id = request.headers.get("X-User-ID", "anonymous")
+            request.state.verified_roles = [
+                r.strip()
+                for r in request.headers.get("X-User-Role", "user").split(",")
+                if r.strip()
+            ]
+            return
+        if not enable_oidc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized gateway API request",
+            )
+
+    # 2. If Keycloak OIDC is enabled, require and verify the Bearer JWT
+    if enable_oidc:
+        if not bearer_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing OIDC Bearer token",
+            )
+        claims = _verify_oidc_jwt(bearer_token)
+        verified_user = claims.get("preferred_username") or claims.get("sub")
+        if not verified_user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="OIDC token missing subject/username claim",
+            )
+        request.state.verified_user_id = str(verified_user)
+        request.state.verified_roles = claims.get("realm_access", {}).get("roles", [])
+
+
+def verify_admin_auth(request: Request) -> None:
+    """
+    Validates administrative control-plane requests using GATEWAY_ADMIN_TOKEN,
+    GATEWAY_API_KEY, or a Keycloak OIDC JWT containing the 'admin' realm role.
+    """
+    enable_oidc = os.getenv("ENABLE_OIDC", str(ENABLE_OIDC)).lower() == "true"
+    expected = os.getenv("GATEWAY_ADMIN_TOKEN", GATEWAY_ADMIN_TOKEN) or os.getenv(
+        "GATEWAY_API_KEY", GATEWAY_API_KEY
+    )
+    auth_header = request.headers.get("Authorization", "")
+    bearer_token = (
+        auth_header.split(" ", 1)[1].strip()
+        if auth_header.startswith("Bearer ")
+        else ""
+    )
+    admin_header = request.headers.get("X-Admin-Token", "").strip()
+
+    if expected:
+        candidate = admin_header or bearer_token
+        if candidate and hmac.compare_digest(candidate, expected):
+            return
+        if not enable_oidc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized gateway admin request",
+            )
+
+    if enable_oidc:
+        if not bearer_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing OIDC admin Bearer token",
+            )
+        claims = _verify_oidc_jwt(bearer_token)
+        roles = claims.get("realm_access", {}).get("roles", [])
+        if "admin" not in roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Admin role required for gateway control plane",
+            )
+
 
 def flatten_system_message(messages: list) -> list:
     """
@@ -82,18 +478,22 @@ def flatten_system_message(messages: list) -> list:
     """
     system_contents = []
     new_messages = []
-    
+
     for msg in messages:
         if msg.get("role") == "system":
             content = msg.get("content", "")
             if isinstance(content, list):
-                text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+                text_parts = [
+                    item.get("text", "")
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
                 system_contents.append(" ".join(text_parts))
             else:
                 system_contents.append(content)
         else:
             new_messages.append(msg)
-            
+
     if system_contents:
         system_content = "\n\n".join(system_contents)
         first_user_idx = -1
@@ -101,20 +501,28 @@ def flatten_system_message(messages: list) -> list:
             if msg.get("role") == "user":
                 first_user_idx = i
                 break
-                
+
         if first_user_idx != -1:
             original_content = new_messages[first_user_idx].get("content", "")
             if isinstance(original_content, list):
-                new_messages[first_user_idx]["content"].insert(0, {"type": "text", "text": f"System Directive: {system_content}\n\n"})
+                new_messages[first_user_idx]["content"].insert(
+                    0, {"type": "text", "text": f"System Directive: {system_content}\n\n"}
+                )
             else:
-                new_messages[first_user_idx]["content"] = f"System Directive: {system_content}\n\nUser Query: {original_content}"
+                new_messages[first_user_idx]["content"] = (
+                    f"System Directive: {system_content}\n\nUser Query: {original_content}"
+                )
         else:
-            new_messages.insert(0, {"role": "user", "content": f"System Directive: {system_content}"})
-            
+            new_messages.insert(
+                0, {"role": "user", "content": f"System Directive: {system_content}"}
+            )
+
     return new_messages
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+
 
 class UpdateConfigRequest(BaseModel):
     temperature: float = None
@@ -123,78 +531,281 @@ class UpdateConfigRequest(BaseModel):
     vision_token_budget: int = None
     model_variant: str = None
 
+
 @app.get("/", response_class=HTMLResponse)
 async def admin_ui(request: Request):
     """Serves the GDC-styled Admin UI."""
+    sync_shared_state()
     return templates.TemplateResponse(
         request=request,
         name="index.html",
         context={
             "state": CURRENT_STATE,
             "active_framework": ACTIVE_FRAMEWORK,
-            "model_routing": MODEL_ROUTING_CONFIG
-        }
+            "model_routing": MODEL_ROUTING_CONFIG,
+        },
     )
+
+
+# =====================================================================
+# Real Upstream Telemetry Scraping (vLLM Prometheus, DCGM, Ollama /api/ps)
+# =====================================================================
+_PROM_METRIC_LINE_RE = re.compile(
+    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)"
+)
+
+
+def _parse_prometheus_metrics(text: str) -> Dict[str, List[float]]:
+    """Parses Prometheus exposition format lines into metric_name -> list of float values."""
+    parsed: Dict[str, List[float]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _PROM_METRIC_LINE_RE.match(line)
+        if not match:
+            continue
+        metric_name, val_str = match.group(1), match.group(2)
+        try:
+            parsed.setdefault(metric_name, []).append(float(val_str))
+        except ValueError:
+            continue
+    return parsed
+
+
+def _record_completion_tokens(token_count: int) -> None:
+    """Records observed completion tokens in a 60-second sliding window."""
+    if token_count <= 0:
+        return
+    now = time.time()
+    _TOKEN_COMPLETION_HISTORY.append((now, token_count))
+    cutoff = now - 60.0
+    while _TOKEN_COMPLETION_HISTORY and _TOKEN_COMPLETION_HISTORY[0][0] < cutoff:
+        _TOKEN_COMPLETION_HISTORY.pop(0)
+
+
+def _compute_gateway_token_throughput() -> float:
+    """Computes observed tokens/sec over the recent 15-second sliding window."""
+    now = time.time()
+    window_sec = 15.0
+    cutoff = now - window_sec
+    recent_tokens = sum(
+        count for ts, count in _TOKEN_COMPLETION_HISTORY if ts >= cutoff
+    )
+    return round(recent_tokens / window_sec, 2)
+
+
+async def _scrape_backend_telemetry() -> Dict[str, Any]:
+    """
+    Scrapes real telemetry from configured vLLM Prometheus (/metrics), optional NVIDIA DCGM
+    Exporter (DCGM_METRICS_URL), or Ollama (/api/ps). Falls back to deterministic gateway
+    counters when backends are unreachable or disabled in unit tests.
+    """
+    vram_total_gb = float(os.getenv("GPU_VRAM_TOTAL_GB", "24.0"))
+    scrape_enabled = os.getenv("ENABLE_BACKEND_METRICS_SCRAPE", "true").lower() == "true"
+    scrape_timeout = httpx.Timeout(float(os.getenv("METRICS_SCRAPE_TIMEOUT", "1.5")))
+
+    unique_urls = sorted(
+        {url.rstrip("/") for key, url in MODEL_ROUTING_CONFIG.items() if url}
+    )
+
+    kv_cache_percents: List[float] = []
+    requests_running = 0.0
+    requests_waiting = 0.0
+    vllm_throughput = 0.0
+    ollama_vram_used_bytes = 0.0
+    dcgm_gpu_utils: List[float] = []
+    dcgm_vram_used_gb = 0.0
+    dcgm_vram_total_gb = 0.0
+    telemetry_source = "gateway_counters"
+
+    if scrape_enabled and unique_urls:
+        try:
+            async with borrow_http_client(scrape_timeout) as client:
+                dcgm_url = os.getenv("DCGM_METRICS_URL", "").strip()
+                if dcgm_url and hasattr(client, "get"):
+                    try:
+                        resp = await client.get(dcgm_url)
+                        if resp.status_code == 200 and isinstance(resp.text, str):
+                            dcgm_metrics = _parse_prometheus_metrics(resp.text)
+                            if "DCGM_FI_DEV_GPU_UTIL" in dcgm_metrics:
+                                dcgm_gpu_utils.extend(dcgm_metrics["DCGM_FI_DEV_GPU_UTIL"])
+                            fb_used = sum(dcgm_metrics.get("DCGM_FI_DEV_FB_USED", []))
+                            fb_free = sum(dcgm_metrics.get("DCGM_FI_DEV_FB_FREE", []))
+                            if fb_used > 0 or fb_free > 0:
+                                dcgm_vram_used_gb = fb_used / 1024.0
+                                dcgm_vram_total_gb = (fb_used + fb_free) / 1024.0
+                                telemetry_source = "dcgm_exporter"
+                    except Exception as e:
+                        logger.debug(f"DCGM metrics scrape skipped: {e}")
+
+                for base_url in unique_urls:
+                    if not hasattr(client, "get"):
+                        break
+                    if ACTIVE_FRAMEWORK == "vllm":
+                        try:
+                            resp = await client.get(f"{base_url}/metrics")
+                            if resp.status_code == 200 and isinstance(resp.text, str):
+                                prom = _parse_prometheus_metrics(resp.text)
+                                if not prom:
+                                    continue
+                                telemetry_source = "vllm_prometheus"
+                                for cache_key in (
+                                    "vllm:gpu_cache_usage_perc",
+                                    "vllm:kv_cache_usage_perc",
+                                ):
+                                    if cache_key in prom:
+                                        kv_cache_percents.extend(
+                                            [v * 100.0 for v in prom[cache_key]]
+                                        )
+                                requests_running += sum(
+                                    prom.get("vllm:num_requests_running", [])
+                                )
+                                requests_waiting += sum(
+                                    prom.get("vllm:num_requests_waiting", [])
+                                )
+                                if "vllm:avg_generation_throughput_toks_per_s" in prom:
+                                    vllm_throughput += sum(
+                                        prom["vllm:avg_generation_throughput_toks_per_s"]
+                                    )
+                                elif "vllm:generation_tokens_total" in prom:
+                                    total_toks = sum(prom["vllm:generation_tokens_total"])
+                                    now = time.time()
+                                    prev = _LAST_VLLM_GEN_TOKENS.get(base_url)
+                                    _LAST_VLLM_GEN_TOKENS[base_url] = (now, total_toks)
+                                    if prev and now > prev[0] and total_toks >= prev[1]:
+                                        vllm_throughput += (total_toks - prev[1]) / (
+                                            now - prev[0]
+                                        )
+                        except Exception as e:
+                            logger.debug(f"vLLM metrics scrape skipped for {base_url}: {e}")
+                    else:
+                        try:
+                            resp = await client.get(f"{base_url}/api/ps")
+                            if resp.status_code == 200:
+                                ps_data = resp.json()
+                                if isinstance(ps_data, dict) and "models" in ps_data:
+                                    telemetry_source = "ollama_api"
+                                    for m in ps_data.get("models", []):
+                                        ollama_vram_used_bytes += float(
+                                            m.get("size_vram") or m.get("size") or 0.0
+                                        )
+                        except Exception as e:
+                            logger.debug(f"Ollama /api/ps scrape skipped for {base_url}: {e}")
+        except Exception as e:
+            logger.debug(f"Backend telemetry collection fallback: {e}")
+
+    kv_cache_usage_percent = (
+        round(sum(kv_cache_percents) / len(kv_cache_percents), 1)
+        if kv_cache_percents
+        else 0.0
+    )
+
+    if dcgm_vram_total_gb > 0:
+        vram_total_gb = round(dcgm_vram_total_gb, 1)
+        vram_used_gb = round(dcgm_vram_used_gb, 2)
+    elif telemetry_source == "ollama_api" and ollama_vram_used_bytes > 0:
+        vram_used_gb = round(ollama_vram_used_bytes / (1024.0**3), 2)
+    elif telemetry_source == "vllm_prometheus":
+        # vLLM pre-allocates --gpu-memory-utilization (default 0.90) and tracks active KV-cache %
+        gpu_mem_fraction = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90"))
+        vram_used_gb = round(vram_total_gb * gpu_mem_fraction, 2)
+    else:
+        vram_used_gb = 0.0
+
+    vram_percent = (
+        round((vram_used_gb / vram_total_gb) * 100.0, 1) if vram_total_gb > 0 else 0.0
+    )
+
+    if dcgm_gpu_utils:
+        gpu_util = round(sum(dcgm_gpu_utils) / len(dcgm_gpu_utils), 1)
+    elif telemetry_source == "vllm_prometheus":
+        # Derive active GPU saturation from running requests and KV-cache occupancy
+        gpu_util = (
+            round(min(100.0, max(kv_cache_usage_percent, requests_running * 25.0)), 1)
+            if requests_running > 0
+            else round(kv_cache_usage_percent, 1)
+        )
+    else:
+        gpu_util = 0.0
+
+    throughput = (
+        round(vllm_throughput, 2)
+        if vllm_throughput > 0
+        else _compute_gateway_token_throughput()
+    )
+
+    active_session_count = sum(
+        1
+        for s in ACTIVE_SESSIONS.values()
+        if s.get("status") in ("active", "generating") and not s.get("killed", False)
+    )
+
+    return {
+        "gpu_utilization": gpu_util,
+        "vram_total_gb": vram_total_gb,
+        "vram_used_gb": vram_used_gb,
+        "vram_percent": vram_percent,
+        "kv_cache_usage_percent": kv_cache_usage_percent,
+        "vllm_requests_running": int(requests_running),
+        "vllm_requests_waiting": int(requests_waiting),
+        "db_connections": active_session_count,
+        "request_throughput": throughput,
+        "telemetry_source": telemetry_source,
+    }
+
 
 @app.get("/api/metrics")
 async def get_metrics():
-    global ACTIVE_COMPLETIONS_COUNT, ACTIVE_SESSIONS
-    
-    # Get real system CPU utilization using psutil
+    sync_shared_state()
     try:
         cpu_util = psutil.cpu_percent(interval=None)
     except Exception:
-        cpu_util = random.uniform(15.0, 25.0)
-        
-    # Emulate GPU/VRAM usage
-    vram_total = 24.0 # GB
-    vram_used = 22.4 # GB base unquantized footprint
-    
-    if ACTIVE_COMPLETIONS_COUNT > 0:
-        gpu_util = random.uniform(65.0, 95.0)
-        vram_used += random.uniform(0.2, 0.8)
-    else:
-        gpu_util = random.uniform(0.0, 2.0)
-        vram_used += random.uniform(-0.05, 0.05)
-        
-    vram_percent = (vram_used / vram_total) * 100
-    
-    # Database connection pool emulation relative to active sessions
-    db_connections = len(ACTIVE_SESSIONS) * 2 + random.randint(2, 5)
-    
+        cpu_util = 0.0
+
+    backend_stats = await _scrape_backend_telemetry()
+
     return {
         "cpu_utilization": round(cpu_util, 1),
-        "gpu_utilization": round(gpu_util, 1),
-        "vram_total_gb": vram_total,
-        "vram_used_gb": round(vram_used, 2),
-        "vram_percent": round(vram_percent, 1),
+        "gpu_utilization": backend_stats["gpu_utilization"],
+        "vram_total_gb": backend_stats["vram_total_gb"],
+        "vram_used_gb": backend_stats["vram_used_gb"],
+        "vram_percent": backend_stats["vram_percent"],
+        "kv_cache_usage_percent": backend_stats["kv_cache_usage_percent"],
+        "vllm_requests_running": backend_stats["vllm_requests_running"],
+        "vllm_requests_waiting": backend_stats["vllm_requests_waiting"],
         "active_completions": ACTIVE_COMPLETIONS_COUNT,
         "active_sessions_count": len(ACTIVE_SESSIONS),
-        "db_connections": db_connections,
-        "request_throughput": round(ACTIVE_COMPLETIONS_COUNT * random.uniform(0.8, 1.2), 2)
+        "db_connections": backend_stats["db_connections"],
+        "request_throughput": backend_stats["request_throughput"],
+        "telemetry_source": backend_stats["telemetry_source"],
     }
 
 
 @app.get("/api/sessions")
 async def get_sessions():
-    global ACTIVE_SESSIONS
+    sync_shared_state()
     return list(ACTIVE_SESSIONS.values())
 
 
 @app.post("/api/sessions/{session_id}/kill")
 async def kill_session(session_id: str, _auth: None = Depends(verify_admin_auth)):
-    global ACTIVE_SESSIONS
+    sync_shared_state()
     if session_id in ACTIVE_SESSIONS:
         ACTIVE_SESSIONS[session_id]["killed"] = True
         ACTIVE_SESSIONS[session_id]["status"] = "killed"
+        persist_shared_state()
         logger.warning(f"Session {session_id} flagged for administrative termination.")
-        return {"status": "success", "message": f"Session {session_id} flagged for termination."}
+        return {
+            "status": "success",
+            "message": f"Session {session_id} flagged for termination.",
+        }
     raise HTTPException(status_code=404, detail="Session not found.")
 
 
 @app.get("/api/users/blocked")
 async def get_blocked_users():
-    global BLOCKED_USERS
+    sync_shared_state()
     return list(BLOCKED_USERS)
 
 
@@ -203,99 +814,202 @@ class BlockUserRequest(BaseModel):
 
 
 @app.post("/api/users/{user_id}/block")
-async def block_user(user_id: str, req: BlockUserRequest):
-    global BLOCKED_USERS, ACTIVE_SESSIONS
+async def block_user(
+    user_id: str, req: BlockUserRequest, _auth: None = Depends(verify_admin_auth)
+):
+    sync_shared_state()
     if req.blocked:
         BLOCKED_USERS.add(user_id)
         logger.warning(f"User {user_id} has been administratively blocked.")
         # Disconnect all active sessions for this blocked user
-        for session_id, session in ACTIVE_SESSIONS.items():
+        for _session_id, session in ACTIVE_SESSIONS.items():
             if session["user_id"] == user_id:
                 session["killed"] = True
                 session["status"] = "killed"
     else:
         BLOCKED_USERS.discard(user_id)
         logger.info(f"User {user_id} has been administratively unblocked.")
+    persist_shared_state()
     return {"status": "success", "blocked": user_id in BLOCKED_USERS}
 
 
 @app.get("/api/config")
 async def get_config():
+    sync_shared_state()
     return CURRENT_STATE
 
+
 @app.post("/api/config")
-async def update_config(config: UpdateConfigRequest, _auth: None = Depends(verify_admin_auth)):
-    global CURRENT_STATE
-    if config.temperature is not None: CURRENT_STATE["temperature"] = config.temperature
-    if config.top_p is not None: CURRENT_STATE["top_p"] = config.top_p
-    if config.frequency_penalty is not None: CURRENT_STATE["frequency_penalty"] = config.frequency_penalty
-    if config.vision_token_budget is not None: CURRENT_STATE["vision_token_budget"] = config.vision_token_budget
-    if config.model_variant is not None: CURRENT_STATE["model_variant"] = config.model_variant
+async def update_config(
+    config: UpdateConfigRequest, _auth: None = Depends(verify_admin_auth)
+):
+    sync_shared_state()
+    if config.temperature is not None:
+        CURRENT_STATE["temperature"] = config.temperature
+    if config.top_p is not None:
+        CURRENT_STATE["top_p"] = config.top_p
+    if config.frequency_penalty is not None:
+        CURRENT_STATE["frequency_penalty"] = config.frequency_penalty
+    if config.vision_token_budget is not None:
+        CURRENT_STATE["vision_token_budget"] = config.vision_token_budget
+    if config.model_variant is not None:
+        CURRENT_STATE["model_variant"] = config.model_variant
+    persist_shared_state()
     logger.info(f"Configuration updated: {CURRENT_STATE}")
     return {"status": "success", "new_state": CURRENT_STATE}
+
 
 @app.get("/v1/models")
 async def list_models():
     """OpenAI-compatible models discovery endpoint."""
+    sync_shared_state()
     if ACTIVE_FRAMEWORK == "ollama":
         model_variant = CURRENT_STATE.get("model_variant", "26b")
         return {
             "object": "list",
             "data": [
-                {"id": f"gemma4:{model_variant}", "object": "model", "created": 1714500000, "owned_by": "gdc-platform"}
-            ]
+                {
+                    "id": f"gemma4:{model_variant}",
+                    "object": "model",
+                    "created": 1714500000,
+                    "owned_by": "gdc-platform",
+                }
+            ],
         }
     else:
         model_data = []
         for model_id in MODEL_ROUTING_CONFIG.keys():
             if model_id != "*":
-                model_data.append({"id": model_id, "object": "model", "created": 1714500000, "owned_by": "gdc-platform"})
+                model_data.append(
+                    {
+                        "id": model_id,
+                        "object": "model",
+                        "created": 1714500000,
+                        "owned_by": "gdc-platform",
+                    }
+                )
         if not model_data:
-            model_data = [{"id": "gemma4:26b", "object": "model", "created": 1714500000, "owned_by": "gdc-platform"}]
+            model_data = [
+                {
+                    "id": "gemma4:26b",
+                    "object": "model",
+                    "created": 1714500000,
+                    "owned_by": "gdc-platform",
+                }
+            ]
         return {"object": "list", "data": model_data}
 
-def classify_prompt_complexity(payload: dict) -> str:
+
+# =====================================================================
+# Hardened Prompt Complexity Classifier (Word-Boundary & Structural Signals)
+# =====================================================================
+_BENIGN_CONVERSATIONAL_IDIOMS_RE = re.compile(
+    r"\b(?:"
+    r"for\s+some\s+reason|for\s+no\s+reason|no\s+reason|within\s+reason|voice\s+of\s+reason|"
+    r"zip\s+code|postal\s+code|area\s+code|country\s+code|dress\s+code|promo\s+code|"
+    r"discount\s+code|coupon\s+code|qr\s+code|bar\s+code|barcode|passcode|pin\s+code|"
+    r"tv\s+program|loyalty\s+program|rewards\s+program|training\s+program"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_STRUCTURAL_COMPLEXITY_RE = re.compile(
+    r"(?:```|"
+    r"\bselect\b[\s\S]{1,200}\bfrom\b|"
+    r"\b(?:create|alter|drop)\s+table\b|"
+    r"traceback\s*\(most\s+recent\s+call\s+last\)|"
+    r"\$\$|\\frac\{|\\int_|\\sum_)",
+    re.IGNORECASE,
+)
+
+_COMPLEXITY_PHRASES_RE = re.compile(
+    r"(?:"
+    r"\bwrite\s+a\s+class\b|"
+    r"\bsolve\s+for\b|"
+    r"\bstep-by-step\b|"
+    r"\bdetailed\s+explanation\b|"
+    r"\broot\s+cause\b|"
+    r"\b(?:"
+    r"code|coding|function|functions|program|programming|script|scripts|"
+    r"algorithm|algorithms|implement|implementation|refactor|debug|debugging|"
+    r"optimize|architecture|sql|math|mathematics|calculate|prove|equation|equations|"
+    r"formula|formulas|derivative|derivatives|integral|integrals|theorem|"
+    r"reason|reasoning|analyze|analysis|logic|deduce|proof"
+    r")\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def classify_prompt_complexity(
+    payload: dict, request_headers: Optional[Dict[str, str]] = None
+) -> str:
     """
-    Heuristically parses the request messages prompt.
-    Returns 'gemma4:31b' (Dense) if complex logic, code, or math is detected.
+    Parses the request messages prompt and optional routing headers.
+    Returns 'gemma4:31b' (Dense) if complex logic, code, SQL, or math is detected.
     Returns the dynamic override variant (hot-swapped from Admin Control Plane) for general conversational queries.
     """
+    if request_headers:
+        explicit_tier = (
+            request_headers.get("X-Task-Complexity")
+            or request_headers.get("x-task-complexity")
+            or request_headers.get("X-Model-Tier")
+            or request_headers.get("x-model-tier")
+            or ""
+        ).strip().lower()
+        if explicit_tier in ("high", "complex", "dense", "31b"):
+            logger.info(
+                f"[Classifier] Explicit complexity header '{explicit_tier}' -> gemma4:31b"
+            )
+            return "gemma4:31b"
+        if explicit_tier in ("low", "simple", "moe", "26b"):
+            fallback_variant = CURRENT_STATE.get("model_variant", "26b")
+            return f"gemma4:{fallback_variant}"
+
     messages = payload.get("messages", [])
     if not messages:
         fallback_variant = CURRENT_STATE.get("model_variant", "26b")
         return f"gemma4:{fallback_variant}"
-        
+
     # Evaluate only the latest user prompt content (the last user message in the array)
     full_prompt = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content")
             if isinstance(content, list):
-                # Multimodal block content
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        full_prompt = item.get("text", "")
-                        break
+                text_blocks = [
+                    item.get("text", "")
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                full_prompt = "\n".join(text_blocks)
             elif isinstance(content, str):
                 full_prompt = content
             break
-            
-    full_prompt = full_prompt.lower()
-    
-    # Heuristic logic, coding, and math keywords list
-    complexity_keywords = [
-        "code", "function", "program", "script", "algorithm", "implement", "write a class",
-        "math", "calculate", "prove", "equation", "formula", "solve for", "derivative", "integral",
-        "reason", "analyze", "step-by-step", "detailed explanation", "logic", "deduce", "proof"
-    ]
-    
-    for kw in complexity_keywords:
-        if kw in full_prompt:
-            logger.info(f"[Classifier] Complexity keyword detected: '{kw}'. Routing to Gemma 4 31B Dense.")
-            return "gemma4:31b"
-            
+
+    # 1. Check structural code/SQL/math/stack-trace patterns first
+    if _STRUCTURAL_COMPLEXITY_RE.search(full_prompt):
+        logger.info(
+            "[Classifier] Structural code/SQL/math block detected. Routing to Gemma 4 31B Dense."
+        )
+        return "gemma4:31b"
+
+    # 2. Strip benign conversational idioms ('for some reason', 'zip code', etc.) before keyword matching
+    scrubbed_prompt = _BENIGN_CONVERSATIONAL_IDIOMS_RE.sub(" ", full_prompt.lower())
+
+    # 3. Match complexity terms on strict word boundaries
+    match = _COMPLEXITY_PHRASES_RE.search(scrubbed_prompt)
+    if match:
+        matched_kw = match.group(0)
+        logger.info(
+            f"[Classifier] Complexity keyword detected: '{matched_kw}'. Routing to Gemma 4 31B Dense."
+        )
+        return "gemma4:31b"
+
     fallback_variant = CURRENT_STATE.get("model_variant", "26b")
-    logger.info(f"[Classifier] General conversational query detected. Routing to dynamic override: gemma4:{fallback_variant}")
+    logger.info(
+        f"[Classifier] General conversational query detected. Routing to dynamic override: gemma4:{fallback_variant}"
+    )
     return f"gemma4:{fallback_variant}"
 
 
@@ -307,54 +1021,75 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
     Injects Gemma 4 specific headers (e.g. for Vision Token Budgets).
     """
     global ACTIVE_COMPLETIONS_COUNT, ACTIVE_SESSIONS, BLOCKED_USERS
-    
-    # Extract user and session metadata
-    user_id = request.headers.get("X-User-ID", "anonymous")
-    
+    sync_shared_state()
+
+    # Use cryptographically verified OIDC user ID when available; otherwise fall back to X-User-ID header
+    user_id = getattr(request.state, "verified_user_id", None) or request.headers.get(
+        "X-User-ID", "anonymous"
+    )
+
     # Blocklist boundary check
     if user_id in BLOCKED_USERS:
         logger.warning(f"Blocked user {user_id} attempted to access completion APIs.")
-        raise HTTPException(status_code=403, detail="User has been administratively blocked.")
-        
+        raise HTTPException(
+            status_code=403, detail="User has been administratively blocked."
+        )
+
     client_ip = request.client.host if request.client else "unknown"
     session_id = f"{user_id}@{client_ip}"
-    
-    payload = await request.json()
-    
-    # Inject system-wide generation parameters if not specified in request
-    if "temperature" not in payload: payload["temperature"] = CURRENT_STATE["temperature"]
-    if "top_p" not in payload: payload["top_p"] = CURRENT_STATE["top_p"]
-    if "frequency_penalty" not in payload: payload["frequency_penalty"] = CURRENT_STATE["frequency_penalty"]
 
-    # Determine target URL based on requested model
+    payload = await request.json()
+
+    # Inject system-wide generation parameters if not specified in request
+    if "temperature" not in payload:
+        payload["temperature"] = CURRENT_STATE["temperature"]
+    if "top_p" not in payload:
+        payload["top_p"] = CURRENT_STATE["top_p"]
+    if "frequency_penalty" not in payload:
+        payload["frequency_penalty"] = CURRENT_STATE["frequency_penalty"]
+
     # Determine target URL based on requested model and dynamic classification
     requested_model = payload.get("model", "default")
-    
+
     # 1. If client explicitly requests a specific valid variant
     if requested_model in MODEL_ROUTING_CONFIG and requested_model != "*":
         base_url = MODEL_ROUTING_CONFIG[requested_model]
         payload["model"] = requested_model
         determined_tag = requested_model
-        logger.info(f"Routing to explicitly requested variant: {requested_model} at {base_url}")
+        logger.info(
+            f"Routing to explicitly requested variant: {requested_model} at {base_url}"
+        )
     else:
-        # 2. Dynamic Prompt Routing Classifier (Generic / Default model)
-        determined_tag = classify_prompt_complexity(payload)
+        # 2. Dynamic Prompt Routing Classifier (Generic / Default / Auto model)
+        determined_tag = classify_prompt_complexity(payload, dict(request.headers))
         base_url = MODEL_ROUTING_CONFIG.get(determined_tag)
         if not base_url:
             base_url = MODEL_ROUTING_CONFIG.get("*")
         payload["model"] = determined_tag
-        logger.info(f"[Classifier] Dynamic route resolved: {determined_tag} at {base_url}")
-    
+        logger.info(
+            f"[Classifier] Dynamic route resolved: {determined_tag} at {base_url}"
+        )
+
     if not base_url:
-        raise HTTPException(status_code=400, detail=f"Model '{requested_model}' not configured in routing table.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{requested_model}' not configured in routing table.",
+        )
 
     target_url = f"{base_url}/v1/chat/completions"
 
-    logger.info(f"Routing request (Model: {payload['model']}) to: {target_url} via {ACTIVE_FRAMEWORK}")
+    logger.info(
+        f"Routing request (Model: {payload['model']}) to: {target_url} via {ACTIVE_FRAMEWORK}"
+    )
 
     headers = {
         "Content-Type": "application/json",
-        "X-Gemma-Vision-Budget": str(CURRENT_STATE["vision_token_budget"])
+        "X-Gemma-Vision-Budget": str(CURRENT_STATE["vision_token_budget"]),
+    }
+
+    response_headers = {
+        "X-Model-Used": determined_tag,
+        "X-Model-Tier": "Dense" if "31b" in determined_tag else "MoE",
     }
 
     # Downstream LLM generation timeout. Allow up to 300 seconds for slow/split-model staging servers.
@@ -363,7 +1098,9 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
 
     # Preemptively flatten system message if this model tag is registered as lacking system role support
     if determined_tag in UNSUPPORTED_SYSTEM_ROLE_MODELS:
-        logger.info(f"Model {determined_tag} is registered in UNSUPPORTED_SYSTEM_ROLE_MODELS. Preemptively flattening system messages...")
+        logger.info(
+            f"Model {determined_tag} is registered in UNSUPPORTED_SYSTEM_ROLE_MODELS. Preemptively flattening system messages..."
+        )
         payload["messages"] = flatten_system_message(payload["messages"])
 
     # Create/Update Active Session details
@@ -373,83 +1110,133 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
         "client_ip": client_ip,
         "status": "generating" if payload.get("stream", False) else "active",
         "last_active": datetime.now().strftime("%H:%M:%S"),
-        "killed": False
+        "killed": False,
     }
+    persist_shared_state()
 
     if payload.get("stream", False):
         ACTIVE_COMPLETIONS_COUNT += 1
-        
+
         async def stream_generator():
             global ACTIVE_COMPLETIONS_COUNT, UNSUPPORTED_SYSTEM_ROLE_MODELS
             current_payload = payload
+            streamed_chunks = 0
             try:
-                async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-                    async with client.stream("POST", target_url, json=current_payload, headers=headers) as response:
+                async with borrow_http_client(timeout) as client:
+                    async with client.stream(
+                        "POST", target_url, json=current_payload, headers=headers
+                    ) as response:
                         # Catch system role limitation in-flight for streaming and register/retry
                         if response.status_code == 400:
                             error_content = await response.aread()
                             error_msg = ""
                             try:
-                                error_json = json.loads(error_content.decode('utf-8'))
-                                error_msg = error_json.get("error", {}).get("message", "")
+                                error_json = json.loads(error_content.decode("utf-8"))
+                                error_msg = error_json.get("error", {}).get(
+                                    "message", ""
+                                )
                             except Exception:
                                 pass
-                                
+
                             if "System role not supported" in error_msg:
-                                logger.warning(f"Detected System role limitation on backend {determined_tag}. Registering capability and retrying...")
+                                logger.warning(
+                                    f"Detected System role limitation on backend {determined_tag}. Registering capability and retrying..."
+                                )
                                 UNSUPPORTED_SYSTEM_ROLE_MODELS.add(determined_tag)
-                                
+                                persist_shared_state()
+
                                 # Flatten system message and retry in-flight
                                 retry_payload = current_payload.copy()
-                                retry_payload["messages"] = flatten_system_message(current_payload["messages"])
-                                
-                                async with client.stream("POST", target_url, json=retry_payload, headers=headers) as retry_response:
+                                retry_payload["messages"] = flatten_system_message(
+                                    current_payload["messages"]
+                                )
+
+                                async with client.stream(
+                                    "POST",
+                                    target_url,
+                                    json=retry_payload,
+                                    headers=headers,
+                                ) as retry_response:
                                     if retry_response.status_code != 200:
                                         retry_error = await retry_response.aread()
-                                        logger.error(f"Retried inference engine failed: {retry_error}")
-                                        yield f"data: {json.dumps({'error': {'message': 'Inference engine error'}})}\n\n".encode('utf-8')
+                                        logger.error(
+                                            f"Retried inference engine failed: {retry_error}"
+                                        )
+                                        yield f"data: {json.dumps({'error': {'message': 'Inference engine error'}})}\n\n".encode(
+                                            "utf-8"
+                                        )
                                         return
-                                        
+
                                     async for line in retry_response.aiter_lines():
-                                        if ACTIVE_SESSIONS.get(session_id, {}).get("killed", False):
-                                            yield f"data: {json.dumps({'choices': [{'delta': {'content': '[Stream Terminated By Administrator]'}}], 'finish_reason': 'stop'})}\n\n".encode('utf-8')
+                                        sync_shared_state()
+                                        if ACTIVE_SESSIONS.get(session_id, {}).get(
+                                            "killed", False
+                                        ):
+                                            yield f"data: {json.dumps({'choices': [{'delta': {'content': '[Stream Terminated By Administrator]'}}], 'finish_reason': 'stop'})}\n\n".encode(
+                                                "utf-8"
+                                            )
                                             return
-                                        yield f"{line}\n".encode('utf-8')
+                                        streamed_chunks += 1
+                                        yield f"{line}\n".encode("utf-8")
                                 return
                             else:
-                                logger.error(f"Inference engine returned 400 bad request: {error_content}")
-                                yield f"data: {json.dumps({'error': {'message': error_msg or 'Bad Request'}})}\n\n".encode('utf-8')
+                                logger.error(
+                                    f"Inference engine returned 400 bad request: {error_content}"
+                                )
+                                yield f"data: {json.dumps({'error': {'message': error_msg or 'Bad Request'}})}\n\n".encode(
+                                    "utf-8"
+                                )
                                 return
-                                
+
                         elif response.status_code != 200:
                             error_content = await response.aread()
-                            logger.error(f"Inference engine returned error code {response.status_code}: {error_content}")
-                            yield f"data: {json.dumps({'error': {'message': 'Inference engine error'}})}\n\n".encode('utf-8')
+                            logger.error(
+                                f"Inference engine returned error code {response.status_code}: {error_content}"
+                            )
+                            yield f"data: {json.dumps({'error': {'message': 'Inference engine error'}})}\n\n".encode(
+                                "utf-8"
+                            )
                             return
-                        
+
                         async for line in response.aiter_lines():
-                            # In-flight stream Kill-Switch interception
+                            # Synchronize shared state so multi-replica kill-switches take effect immediately
+                            sync_shared_state()
                             if ACTIVE_SESSIONS.get(session_id, {}).get("killed", False):
-                                logger.warning(f"Streaming connection killed in-flight for session: {session_id}")
-                                yield f"data: {json.dumps({'choices': [{'delta': {'content': '[Stream Terminated By Administrator]'}}], 'finish_reason': 'stop'})}\n\n".encode('utf-8')
+                                logger.warning(
+                                    f"Streaming connection killed in-flight for session: {session_id}"
+                                )
+                                yield f"data: {json.dumps({'choices': [{'delta': {'content': '[Stream Terminated By Administrator]'}}], 'finish_reason': 'stop'})}\n\n".encode(
+                                    "utf-8"
+                                )
                                 return
-                            yield f"{line}\n".encode('utf-8')
+                            streamed_chunks += 1
+                            yield f"{line}\n".encode("utf-8")
             except httpx.RequestError as e:
                 logger.error(f"Inference engine streaming error: {e}")
-                yield f"data: {json.dumps({'error': {'message': 'Error communicating with backend service'}})}\n\n".encode('utf-8')
+                yield f"data: {json.dumps({'error': {'message': 'Error communicating with backend service'}})}\n\n".encode(
+                    "utf-8"
+                )
             finally:
+                _record_completion_tokens(streamed_chunks)
                 ACTIVE_COMPLETIONS_COUNT = max(0, ACTIVE_COMPLETIONS_COUNT - 1)
-                if session_id in ACTIVE_SESSIONS and not ACTIVE_SESSIONS[session_id].get("killed", False):
+                if session_id in ACTIVE_SESSIONS and not ACTIVE_SESSIONS[
+                    session_id
+                ].get("killed", False):
                     ACTIVE_SESSIONS[session_id]["status"] = "idle"
+                    persist_shared_state()
 
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers=response_headers,
+        )
 
     # Non-Streaming completions block
     ACTIVE_COMPLETIONS_COUNT += 1
     try:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        async with borrow_http_client(timeout) as client:
             response = await client.post(target_url, json=payload, headers=headers)
-            
+
             # Catch system role limitation on non-streaming and register/retry
             if response.status_code == 400:
                 try:
@@ -457,25 +1244,62 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                     logger.info(f"[Retry Engine] Downstream 400 raw body: {error_json}")
                     error_msg = error_json.get("error", {}).get("message", "")
                     if "System role not supported" in error_msg:
-                        logger.warning(f"Detected System role limitation on backend {determined_tag} in non-streaming call. Retrying with flattened payload...")
+                        logger.warning(
+                            f"Detected System role limitation on backend {determined_tag} in non-streaming call. Retrying with flattened payload..."
+                        )
                         UNSUPPORTED_SYSTEM_ROLE_MODELS.add(determined_tag)
-                        
+                        persist_shared_state()
+
                         retry_payload = payload.copy()
-                        retry_payload["messages"] = flatten_system_message(payload["messages"])
-                        
-                        retry_response = await client.post(target_url, json=retry_payload, headers=headers)
-                        logger.info(f"[Retry Engine] Retry status: {retry_response.status_code}, body: {retry_response.text}")
-                        return JSONResponse(content=retry_response.json(), status_code=retry_response.status_code)
+                        retry_payload["messages"] = flatten_system_message(
+                            payload["messages"]
+                        )
+
+                        retry_response = await client.post(
+                            target_url, json=retry_payload, headers=headers
+                        )
+                        logger.info(
+                            f"[Retry Engine] Retry status: {retry_response.status_code}, body: {retry_response.text}"
+                        )
+                        retry_body = retry_response.json()
+                        if isinstance(retry_body, dict):
+                            usage = retry_body.get("usage", {})
+                            _record_completion_tokens(
+                                int(usage.get("completion_tokens", 0) or 0)
+                            )
+                        return JSONResponse(
+                            content=retry_body,
+                            status_code=retry_response.status_code,
+                            headers=response_headers,
+                        )
                     else:
-                        logger.info("[Retry Engine] Message did not match limitation context.")
+                        logger.info(
+                            "[Retry Engine] Message did not match limitation context."
+                        )
                 except Exception as e:
-                    logger.exception(f"[Retry Engine] Exception during retry flattening: {e}")
-                    
-            return JSONResponse(content=response.json(), status_code=response.status_code)
+                    logger.exception(
+                        f"[Retry Engine] Exception during retry flattening: {e}"
+                    )
+
+            resp_body = response.json()
+            if isinstance(resp_body, dict):
+                usage = resp_body.get("usage", {})
+                _record_completion_tokens(int(usage.get("completion_tokens", 0) or 0))
+            return JSONResponse(
+                content=resp_body,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
     except httpx.RequestError as e:
         logger.error(f"Inference engine connection error: {e}")
-        raise HTTPException(status_code=502, detail=f"Error communicating with backend service: {base_url}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Error communicating with backend service: {base_url}",
+        )
     finally:
         ACTIVE_COMPLETIONS_COUNT = max(0, ACTIVE_COMPLETIONS_COUNT - 1)
-        if session_id in ACTIVE_SESSIONS and not ACTIVE_SESSIONS[session_id].get("killed", False):
+        if session_id in ACTIVE_SESSIONS and not ACTIVE_SESSIONS[session_id].get(
+            "killed", False
+        ):
             ACTIVE_SESSIONS[session_id]["status"] = "idle"
+            persist_shared_state()

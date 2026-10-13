@@ -37,7 +37,15 @@ gdc:
 # User Cluster workload execution gate (Stage 5: 5-workload-factory)
 apps:
   enabled: true
+  replicas: 1
   activeFramework: "ollama" # Set to "vllm" for GDC-ag vLLM production deployments
   ollamaModelVariant: "26b"
   modelRoutingConfig: ""    # Optional JSON override; auto-selects vllm-*-vllm-service:8000 when activeFramework="vllm"
+  gpuVramTotalGb: "80.0"
+  vllmGpuMemoryUtilization: "0.90"
+  dcgmMetricsUrl: ""
+  enableOidc: false
+  keycloakUrl: "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
+  redisUrl: ""
+  gatewayStateFile: "/tmp/gemma_gateway_state.json"
 

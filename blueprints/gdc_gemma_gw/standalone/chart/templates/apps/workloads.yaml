@@ -33,7 +33,7 @@ metadata:
   labels:
     {{- include "gemma-standalone.labels" . | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.apps.replicas | default 1 }}
   selector:
     matchLabels:
       app: gemma-gateway
@@ -58,6 +58,20 @@ spec:
           value: {{ .Values.apps.ollamaModelVariant | default "26b" | quote }}
         - name: GATEWAY_TIMEOUT
           value: '300.0'
+        - name: GPU_VRAM_TOTAL_GB
+          value: {{ .Values.apps.gpuVramTotalGb | default "80.0" | quote }}
+        - name: VLLM_GPU_MEMORY_UTILIZATION
+          value: {{ .Values.apps.vllmGpuMemoryUtilization | default "0.90" | quote }}
+        - name: DCGM_METRICS_URL
+          value: {{ .Values.apps.dcgmMetricsUrl | default "" | quote }}
+        - name: ENABLE_OIDC
+          value: {{ .Values.apps.enableOidc | default false | quote }}
+        - name: KEYCLOAK_URL
+          value: {{ .Values.apps.keycloakUrl | default "http://keycloak-svc:8080/auth/realms/gdc-rag-realm" | quote }}
+        - name: REDIS_URL
+          value: {{ .Values.apps.redisUrl | default "" | quote }}
+        - name: GATEWAY_STATE_FILE
+          value: {{ .Values.apps.gatewayStateFile | default "/tmp/gemma_gateway_state.json" | quote }}
         - name: MODEL_ROUTING_CONFIG
           {{- if .Values.apps.modelRoutingConfig }}
           value: {{ .Values.apps.modelRoutingConfig | quote }}
