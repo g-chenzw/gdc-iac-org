@@ -48,4 +48,7 @@ apps:
   keycloakUrl: "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
   redisUrl: ""
   gatewayStateFile: "/tmp/gemma_gateway_state.json"
-
+  # Optional Envoy InferencePool + epp Endpoint Picker backend integration (blueprints/envoy-inference-pool)
+  envoyInferencePool:
+    enabled: false
+    serviceUrl: "http://gemma-envoy-inference-pool:80"

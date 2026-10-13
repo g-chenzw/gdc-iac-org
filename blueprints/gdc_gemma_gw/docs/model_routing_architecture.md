@@ -223,6 +223,27 @@ DEFAULT_ROUTING = '{"gemma4:26b": "http://ollama-26b-service:11434", "gemma4:31b
 MODEL_ROUTING_CONFIG = json.loads(os.getenv("MODEL_ROUTING_CONFIG", DEFAULT_ROUTING))
 ```
 
+### 4.2 Optional Two-Tier Routing with Envoy `InferencePool` + `epp` Endpoint Picker (`blueprints/envoy-inference-pool`)
+
+When `vllm-26b` or `vllm-31b` is scaled horizontally across multiple GPU replicas (`replicaCount > 1`), standard Kubernetes `ClusterIP` round-robin load balancing is blind to per-pod KV-cache saturation and prefix-cache state.
+
+By deploying the optional [`blueprints/envoy-inference-pool`](../blueprints/envoy-inference-pool/README.md) chart and setting `apps.envoyInferencePool.enabled: true` on `gemma-gateway`, the gateway inserts an **Envoy AI Gateway + Gateway API Inference Extension (`InferencePool` + `epp` Endpoint Picker)** tier between `gemma-gateway` and the `vllm-26b` / `vllm-31b` pods:
+
+1. **Header Propagation (`gateway/proxy/main.py`)**:
+   After authenticating the user via Keycloak OIDC and classifying the prompt (`gemma4:26b` vs `gemma4:31b`), `gemma-gateway` injects two downstream headers on every upstream request:
+   - `X-User-ID`: The cryptographically verified Keycloak user principal (`preferred_username` / `sub`).
+   - `x-ai-eg-model`: The resolved target model tier (`gemma4:26b` or `gemma4:31b`).
+2. **Per-User Token Rate Limiting (`BackendTrafficPolicy` + `llmRequestCosts`)**:
+   Envoy's `AIGatewayRoute` extracts `llm_input_token`, `llm_output_token`, and `llm_total_tokens` from vLLM responses and charges them against each user's hourly token budget (`default: 50,000 tokens/hour` keyed by `X-User-ID`).
+3. **KV-Cache & Prefix-Cache Pod Selection (`InferencePool` + `epp`)**:
+   Envoy routes `x-ai-eg-model: gemma4:26b` to `InferencePool/vllm-26b-pool` (`InferenceObjective` priority `100`) and `x-ai-eg-model: gemma4:31b` to `InferencePool/vllm-31b-pool` (`InferenceObjective` priority `50`). The `epp` Endpoint Picker (`v1.3.0`) scrapes live vLLM Prometheus metrics (`:8000/metrics`) and selects the optimal replica using:
+   - `prefix-cache-scorer` (`weight: 3`)
+   - `kv-cache-utilization-scorer` (`weight: 2`)
+   - `queue-scorer` (`weight: 2`)
+4. **Automatic Fail-Safe**:
+   If `gemma-envoy-inference-pool` is unreachable, `gemma-gateway` automatically fails over to direct `http://vllm-{variant}-vllm-gke-service:8000` (or `ollama-{variant}-service:11434`) without dropping in-flight completions.
+
+
 ---
 
 ## 5. Validating Routing Logic via Pytest

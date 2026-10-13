@@ -497,3 +497,40 @@ In production air-gapped environments, cross-project gateway access must be cryp
 *   **Architecture & Claims Validation**: The client frontend triggers the OIDC Authorization Code Flow (with PKCE) directly against Keycloak, obtaining a JWT (Access Token) which is dynamically attached as an `Authorization: Bearer <JWT>` header to downstream requests. The FastAPI backend cryptographically validates this signature using the Keycloak certificates (`/certs`).
 *   **Detailed Implementation Guide**: Refer to the complete, step-by-step [Keycloak Integration Guide](keycloak_integration_guide.md) for instructions on provisioning Keycloak Realms, configuring clients (`rag-frontend`), updating Axios token interceptors in React, and building robust OIDC validation middleware in python/FastAPI.
 
+---
+
+## 5. Multi-Replica vLLM Scaling with Envoy `InferencePool` + `epp` Endpoint Picker
+
+When scaling `vllm-26b` or `vllm-31b` beyond a single GPU pod (`replicaCount > 1`) to serve Medium (3,000 RPM) or Large (6,000 RPM) enterprise workloads, standard Kubernetes `Service` round-robin load balancing can cause KV-cache hotspots and prefix-cache misses across replicas.
+
+This repository packages an optional **Envoy `InferencePool` + `epp` Endpoint Picker** Helm chart in [`blueprints/envoy-inference-pool`](../blueprints/envoy-inference-pool/README.md) that integrates directly with `gemma-gateway` and `blueprints/vllm-gke`:
+
+1. **Pod Label Integration (`blueprints/vllm-gke`)**:
+   All `vllm-gke` pods automatically carry `inference.networking.k8s.io/engine-type: vllm`, `app.kubernetes.io/name: vllm-gke`, and `app.kubernetes.io/instance: <release-name>` (`vllm-26b` or `vllm-31b`).
+2. **Telemetry-Driven Pod Selection (`epp:v1.3.0`)**:
+   The `vllm-26b-epp` and `vllm-31b-epp` Endpoint Picker deployments scrape vLLM's `/metrics` endpoint (`vllm:gpu_cache_usage_perc`, `vllm:num_requests_waiting`) and score candidate pods using `prefix-cache-scorer` (`weight: 3`), `kv-cache-utilization-scorer` (`weight: 2`), and `queue-scorer` (`weight: 2`).
+3. **Per-User Token Rate Limiting (`BackendTrafficPolicy`)**:
+   `gemma-gateway` forwards the verified `X-User-ID` and `x-ai-eg-model` headers to `gemma-envoy-inference-pool`, enabling Envoy's `AIGatewayRoute` (`llmRequestCosts`) and `BackendTrafficPolicy` to enforce per-user hourly token quotas (`default: 50,000 tokens/hour`).
+
+### Enabling `envoy-inference-pool` via Helm
+
+```bash
+# 1. Deploy the Envoy InferencePool + epp Endpoint Picker chart
+helm upgrade --install gemma-envoy-pool ./blueprints/envoy-inference-pool \
+  --namespace gemma-inference \
+  --set global.namespace=gemma-inference \
+  --set global.registry="harbor.gdc.local/gemma-repo" \
+  --set tokenRateLimit.enabled=true \
+  --set tokenRateLimit.limit=50000
+
+# 2. Configure gemma-gateway to route upstream traffic through gemma-envoy-inference-pool
+helm upgrade --install gemma-gateway ./standalone/chart \
+  --namespace gemma-inference \
+  --set global.namespace=gemma-inference \
+  --set apps.activeFramework=vllm \
+  --set apps.enableOidc=true \
+  --set apps.envoyInferencePool.enabled=true \
+  --set apps.envoyInferencePool.serviceUrl="http://gemma-envoy-inference-pool:80"
+```
+
+

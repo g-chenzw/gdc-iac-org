@@ -55,9 +55,19 @@
         },
         "modelRoutingConfig": {
           "type": "string"
+        },
+        "envoyInferencePool": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "serviceUrl": {
+              "type": "string"
+            }
+          }
         }
       }
     }
   }
 }
-

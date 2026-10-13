@@ -692,5 +692,50 @@ def test_keycloak_oidc_jwt_verification_and_spoof_prevention(monkeypatch):
     main.BLOCKED_USERS.clear()
 
 
+def test_envoy_inference_pool_headers_and_routing(monkeypatch):
+    """Verify X-User-ID and x-ai-eg-model headers are forwarded to Envoy InferencePool."""
+    monkeypatch.setattr(main, "ACTIVE_FRAMEWORK", "vllm")
+    monkeypatch.setattr(
+        main,
+        "MODEL_ROUTING_CONFIG",
+        {
+            "gemma4:26b": "http://gemma-envoy-inference-pool:80",
+            "gemma4:31b": "http://gemma-envoy-inference-pool:80",
+            "*": "http://gemma-envoy-inference-pool:80",
+        },
+    )
+
+    mock_client = MagicMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "choices": [{"message": {"content": "Routed via Envoy InferencePool + epp!"}}]
+    }
+    mock_client.post = AsyncMock(return_value=mock_response)
+    monkeypatch.setattr("httpx.AsyncClient", MagicMock(return_value=mock_client))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        headers={"X-User-ID": "analyst-alice"},
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Write a Python algorithm to solve this differential equation step-by-step.",
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    called_url = mock_client.post.call_args[0][0]
+    called_headers = mock_client.post.call_args[1]["headers"]
+    assert called_url == "http://gemma-envoy-inference-pool:80/v1/chat/completions"
+    assert called_headers["X-User-ID"] == "analyst-alice"
+    assert called_headers["x-ai-eg-model"] == "gemma4:31b"
+
+
+
 
 

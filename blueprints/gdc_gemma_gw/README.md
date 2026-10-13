@@ -280,9 +280,10 @@ Refer to the [GDC Testing Methodology](docs/testing-methodology.md) for complete
 
 ## Helm & IaC Orchestrated Deployment (`gdc-iac-org` Integration)
 
-All Gemma Gateway and Gemma Client components include standardized Helm charts (`blueprints/ollama-gke`, `blueprints/vllm-gke`, `standalone/chart`, and `gemma-client/chart`) compatible with the `gdc-iac-org` layered Helmfile orchestration (`foundations/releases/5-workload-factory`).
+All Gemma Gateway and Gemma Client components include standardized Helm charts (`blueprints/ollama-gke`, `blueprints/vllm-gke`, `blueprints/envoy-inference-pool`, `standalone/chart`, and `gemma-client/chart`) compatible with the `gdc-iac-org` layered Helmfile orchestration (`foundations/releases/5-workload-factory`).
 - **Zonal Managed Databases (`Stage 2: 2-resources`)**: Provisioned via core `charts/gdc-dbs` (`gdc.enabled: false` by default in `gemma-client/chart`).
 - **Shared/User Cluster GPU Node Pools (`Stage 3: 3-clusters`)**: Provisioned via `charts/gdc-clusters` with `hgx-h200-1g` (NVIDIA H200 141GB) node pools (`pool: gpu-moe` and `pool: gpu-dense`).
+- **Optional Envoy `InferencePool` + `epp` Endpoint Picker (`blueprints/envoy-inference-pool`)**: When scaling `vllm-26b` or `vllm-31b` across multiple GPU replicas (`replicaCount > 1`) or enforcing strict per-user hourly token budgets, enable [`blueprints/envoy-inference-pool`](blueprints/envoy-inference-pool/README.md). `gemma-gateway` acts as the L7 Gemma-aware Control Plane (verifying Keycloak OIDC JWTs, classifying prompt complexity, injecting `X-User-ID` and `x-ai-eg-model`) and forwards traffic to `gemma-envoy-inference-pool`, which enforces per-user token rate limits (`BackendTrafficPolicy` + `llmRequestCosts`) and delegates pod selection to the Gateway API Inference Extension `epp` Endpoint Picker (`prefix-cache-scorer`, `kv-cache-utilization-scorer`, and `queue-scorer`).
 - **Cluster Workloads (`Stage 5: 5-workload-factory`)**: Declared under `projects[].resources.patterns[]` in `foundations/bases/environments/<env>/zone1/tenant-1.yaml` using `values_files` to load `values-gdc.yaml`:
 
 ```yaml
@@ -297,6 +298,7 @@ All Gemma Gateway and Gemma Client components include standardized Helm charts (
                   values_files:
                     - "../../../blueprints/gdc_gemma_gw/blueprints/vllm-gke/values-gdc.yaml"
                   values:
+                    replicaCount: 2
                     model:
                       name: "/models/gemma-4-26B-A4B-it-weights"
                       servedModelName: "gemma4:26b"
@@ -313,6 +315,7 @@ All Gemma Gateway and Gemma Client components include standardized Helm charts (
                   values_files:
                     - "../../../blueprints/gdc_gemma_gw/blueprints/vllm-gke/values-gdc.yaml"
                   values:
+                    replicaCount: 2
                     model:
                       name: "/models/gemma-4-31B-it-weights"
                       servedModelName: "gemma4:31b"
@@ -320,6 +323,20 @@ All Gemma Gateway and Gemma Client components include standardized Helm charts (
                       existingClaim: "vllm-26b-vllm-weights"
                     nodeSelector:
                       pool: "gpu-dense"
+
+                # Optional: Envoy InferencePool + epp Endpoint Picker & Per-User Token Rate Limiter
+                - name: "gemma-envoy-pool"
+                  pattern: "gdc-gemma-envoy-inference-pool"
+                  chart_path: "../../../blueprints/gdc_gemma_gw/blueprints/envoy-inference-pool"
+                  namespace: "gemma-inference"
+                  registry: "harbor.gdc.local/gemma-repo"
+                  deploy_gdc_resources: false
+                  deploy_apps: true
+                  values:
+                    tokenRateLimit:
+                      enabled: true
+                      limit: 50000
+                      unit: "Hour"
 
                 - name: "gemma-gateway"
                   pattern: "gdc-gemma-gateway"
@@ -331,6 +348,9 @@ All Gemma Gateway and Gemma Client components include standardized Helm charts (
                   values:
                     apps:
                       activeFramework: "vllm"
+                      envoyInferencePool:
+                        enabled: false # Set to true when gemma-envoy-pool is deployed
+                        serviceUrl: "http://gemma-envoy-inference-pool:80"
 
                 - name: "gemma-client"
                   pattern: "gdc-gemma-client"

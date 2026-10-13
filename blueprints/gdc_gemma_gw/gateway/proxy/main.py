@@ -77,10 +77,28 @@ OLLAMA_MODEL_VARIANT = os.getenv("OLLAMA_MODEL_VARIANT", "26b")
 # Routing table for models.
 # For Ollama, we map specific tags to their standalone variant services.
 # For vLLM, we route different model tags to their GPU serving nodes.
+# When ENVOY_INFERENCE_POOL_ENABLED=true, we route through the Envoy InferencePool
+# + epp Endpoint Picker (blueprints/envoy-inference-pool) for KV-cache-aware pod selection.
+ENVOY_INFERENCE_POOL_ENABLED = (
+    os.getenv("ENVOY_INFERENCE_POOL_ENABLED", "false").lower() == "true"
+)
+ENVOY_INFERENCE_POOL_URL = os.getenv(
+    "ENVOY_INFERENCE_POOL_URL", "http://gemma-envoy-inference-pool:80"
+).rstrip("/")
 DEFAULT_ROUTING = (
-    '{"gemma4:26b": "http://ollama-26b-service:11434", "gemma4:31b": "http://ollama-31b-service:11434", "*": "http://ollama-26b-service:11434"}'
-    if ACTIVE_FRAMEWORK == "ollama"
-    else '{"gemma4:26b": "http://vllm-26b-vllm-gke-service:8000", "gemma4:31b": "http://vllm-31b-vllm-gke-service:8000", "*": "http://vllm-26b-vllm-gke-service:8000"}'
+    json.dumps(
+        {
+            "gemma4:26b": ENVOY_INFERENCE_POOL_URL,
+            "gemma4:31b": ENVOY_INFERENCE_POOL_URL,
+            "*": ENVOY_INFERENCE_POOL_URL,
+        }
+    )
+    if ENVOY_INFERENCE_POOL_ENABLED
+    else (
+        '{"gemma4:26b": "http://ollama-26b-service:11434", "gemma4:31b": "http://ollama-31b-service:11434", "*": "http://ollama-26b-service:11434"}'
+        if ACTIVE_FRAMEWORK == "ollama"
+        else '{"gemma4:26b": "http://vllm-26b-vllm-gke-service:8000", "gemma4:31b": "http://vllm-31b-vllm-gke-service:8000", "*": "http://vllm-26b-vllm-gke-service:8000"}'
+    )
 )
 MODEL_ROUTING_CONFIG: Dict[str, str] = json.loads(
     os.getenv("MODEL_ROUTING_CONFIG", DEFAULT_ROUTING)
@@ -1845,6 +1863,8 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
     headers = {
         "Content-Type": "application/json",
         "X-Gemma-Vision-Budget": str(CURRENT_STATE["vision_token_budget"]),
+        "X-User-ID": str(user_id),
+        "x-ai-eg-model": str(determined_tag),
     }
 
     response_headers = {
@@ -1876,6 +1896,10 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
 
     def _get_alternate_engine_base_url(current_base: str, model_tag: str) -> Optional[str]:
         variant = "31b" if "31b" in model_tag else "26b"
+        if "envoy-inference-pool" in current_base:
+            if ACTIVE_FRAMEWORK == "vllm":
+                return f"http://vllm-{variant}-vllm-gke-service:8000"
+            return f"http://ollama-{variant}-service:11434"
         if "vllm-" in current_base:
             return f"http://ollama-{variant}-service:11434"
         if "ollama-" in current_base:
