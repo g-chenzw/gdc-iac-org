@@ -44,13 +44,14 @@ if [[ "$WORKSTATION_URL" =~ ^(http[s]?://)?([0-9]+-)?(w-[a-zA-Z0-9-]+)\.(.+)$ ]]
     VM_HOSTNAME="${BASH_REMATCH[3]}"
     BASE_DOMAIN="${BASH_REMATCH[4]}"
     DYNAMIC_FQDN="${DETECTED_PORT_PREFIX}${VM_HOSTNAME}.${BASE_DOMAIN}"
+    FQDN_8080="8080-${VM_HOSTNAME}.${BASE_DOMAIN}"
     FQDN_8081="8081-${VM_HOSTNAME}.${BASE_DOMAIN}"
     FQDN_8082="8082-${VM_HOSTNAME}.${BASE_DOMAIN}"
     echo ""
     echo "🎯 Dynamic Identity Target Coordinates Discovered:"
     echo "   - Active Workstation VM Hostname: ${VM_HOSTNAME}"
     echo "   - Base Cluster Routing Suffix  : ${BASE_DOMAIN}"
-    echo "   - Whitelisted Preview FQDNs    : ${FQDN_8081}, ${FQDN_8082}"
+    echo "   - Whitelisted Preview FQDNs    : ${FQDN_8080}, ${FQDN_8081}, ${FQDN_8082}"
 else
     # Fallback to direct input if regex fails
     echo "⚠️ Warning: Failed to parse preview URL regex automatically."

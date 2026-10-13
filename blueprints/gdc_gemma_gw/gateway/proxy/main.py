@@ -323,12 +323,13 @@ app = FastAPI(title="Gemma 4 Inference Gateway (GDC-ag)", lifespan=lifespan)
 # =====================================================================
 # Authentication & Keycloak OIDC Federation
 # =====================================================================
-def _get_keycloak_jwks() -> Optional[Dict[str, Any]]:
+def _get_keycloak_jwks(force: bool = False) -> Optional[Dict[str, Any]]:
     """Fetches and caches public verification keys from the configured Keycloak realm."""
     global _JWKS_CACHE
     enable_oidc = os.getenv("ENABLE_OIDC", str(ENABLE_OIDC)).lower() == "true"
+    admin_require_oidc = os.getenv("ADMIN_REQUIRE_OIDC", "true").lower() == "true"
     keycloak_url = os.getenv("KEYCLOAK_URL", KEYCLOAK_URL)
-    if _JWKS_CACHE is None and enable_oidc:
+    if _JWKS_CACHE is None and (enable_oidc or admin_require_oidc or force):
         try:
             certs_url = f"{keycloak_url.rstrip('/')}/protocol/openid-connect/certs"
             with urllib.request.urlopen(certs_url, timeout=5) as response:
@@ -347,7 +348,7 @@ def _verify_oidc_jwt(token: str) -> Dict[str, Any]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="PyJWT with crypto support is required when ENABLE_OIDC=true",
         )
-    jwks = _get_keycloak_jwks()
+    jwks = _get_keycloak_jwks(force=True)
     if not jwks:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -364,7 +365,7 @@ def _verify_oidc_jwt(token: str) -> Dict[str, Any]:
                     signing_key = jwk_set[kid].key
                 except KeyError:
                     _JWKS_CACHE = None
-                    refreshed = _get_keycloak_jwks()
+                    refreshed = _get_keycloak_jwks(force=True)
                     if refreshed and isinstance(refreshed, dict) and "keys" in refreshed:
                         signing_key = PyJWKSet.from_dict(refreshed)[kid].key
                     else:
@@ -736,15 +737,18 @@ def verify_admin_auth(request: Request) -> None:
                 detail=f"Admin role required for gateway control plane (role '{hdr_roles_raw}' is not permitted)",
             )
 
-    # 3. If Keycloak OIDC is enabled, require and verify the Bearer JWT or gateway_oidc_token cookie
-    if enable_oidc:
-        token_candidate = bearer_token or request.cookies.get("gateway_oidc_token", "").strip()
+    # 3. Verify Keycloak OIDC Bearer JWT or gateway_oidc_token cookie whenever present (or required by ENABLE_OIDC)
+    token_candidate = bearer_token or request.cookies.get("gateway_oidc_token", "").strip()
+    if enable_oidc or (token_candidate and token_candidate.count(".") == 2):
         if not token_candidate:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing OIDC admin Bearer token or session. Sign in at /login/oidc.",
+                detail="Missing OIDC admin Bearer token or session. Sign in via Keycloak OIDC.",
             )
         claims = _verify_oidc_jwt(token_candidate)
+        verified_user = str(
+            claims.get("preferred_username") or claims.get("sub") or "oidc-user"
+        )
         roles = [
             str(r).lower()
             for r in claims.get("realm_access", {}).get("roles", [])
@@ -753,11 +757,9 @@ def verify_admin_auth(request: Request) -> None:
         if not (set(roles) & ADMIN_ROLE_NAMES):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Admin role required for gateway control plane",
+                detail=f"Admin role required for gateway control plane (Keycloak user '{verified_user}' has roles: {roles or ['user']})",
             )
-        request.state.verified_user_id = str(
-            claims.get("preferred_username") or claims.get("sub") or "admin"
-        )
+        request.state.verified_user_id = verified_user
         request.state.verified_roles = roles
 
 
@@ -828,10 +830,12 @@ def _get_external_origin(request: Request) -> str:
     forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host") or "localhost:8080"
     host = forwarded_host.split(",")[0].strip()
     forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
-    if forwarded_proto:
-        proto = forwarded_proto
-    elif "cloudworkstations.dev" in host or "gdc.local" in host:
+    origin_hdr = request.headers.get("origin", "").strip()
+    referer_hdr = request.headers.get("referer", "").strip()
+    if "cloudworkstations" in host or "gdc.local" in host or origin_hdr.startswith("https://") or referer_hdr.startswith("https://"):
         proto = "https"
+    elif forwarded_proto:
+        proto = forwarded_proto
     else:
         proto = request.url.scheme if hasattr(request, "url") and getattr(request.url, "scheme", None) else "http"
     return f"{proto}://{host}"
@@ -1003,7 +1007,7 @@ async def gateway_keycloak_redirect(request: Request, redirect_to: str = "/"):
         {
             "client_id": client_id,
             "response_type": "code",
-            "scope": "openid profile email",
+            "scope": "openid profile roles",
             "redirect_uri": callback_uri,
             "state": redirect_to or "/",
         }
@@ -1028,6 +1032,7 @@ async def gateway_keycloak_callback(
         )
 
     origin = _get_external_origin(request)
+    parsed_origin = urllib.parse.urlparse(origin)
     callback_uri = f"{origin}/login/callback"
     keycloak_url = os.getenv("KEYCLOAK_URL", KEYCLOAK_URL).rstrip("/")
     client_id = os.getenv("OIDC_CLIENT_ID", OIDC_CLIENT_ID)
@@ -1044,7 +1049,12 @@ async def gateway_keycloak_callback(
     req = urllib.request.Request(
         token_url,
         data=form_data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Host": parsed_origin.netloc,
+            "X-Forwarded-Host": parsed_origin.netloc,
+            "X-Forwarded-Proto": parsed_origin.scheme,
+        },
         method="POST",
     )
     try:
@@ -1274,25 +1284,15 @@ async def gateway_auth_session_status(request: Request):
 @app.get("/", response_class=HTMLResponse)
 async def admin_ui(request: Request):
     """
-    Serves the GDC-styled Admin UI gated by Keycloak OIDC & RBAC.
-    Browser requests are required to authenticate via Keycloak OIDC (/login/oidc or /login/keycloak)
-    and possess the 'admin' role (e.g. charlie), while keeping programmatic pytest TestClient checks compatible.
+    Serves the GDC-styled Admin UI gated by Keycloak OIDC PKCE & RBAC.
+    The frontend template embeds the same Keycloak OIDC Authorization Code + PKCE handshake
+    as gemma-client (redirecting unauthenticated browsers directly to /auth/realms/gdc-rag-realm/protocol/openid-connect/auth
+    and exchanging ?code=... at root /), while keeping programmatic pytest TestClient checks compatible.
     """
     if request.query_params.get("logout") == "true":
         return await gateway_oidc_logout(request)
     sync_shared_state()
     auth_ctx = get_gateway_auth_context(request)
-
-    user_agent = request.headers.get("user-agent", "")
-    is_test_client = user_agent.startswith("testclient")
-    require_admin_oidc = os.getenv("ADMIN_REQUIRE_OIDC", "true").lower() == "true"
-    readonly_preview = request.query_params.get("readonly_preview") == "true"
-
-    if require_admin_oidc and not is_test_client and not readonly_preview:
-        if not auth_ctx.get("authenticated"):
-            return RedirectResponse(url="/login/oidc", status_code=302)
-        if not auth_ctx.get("is_admin"):
-            return render_gateway_forbidden_page(auth_ctx)
 
     return templates.TemplateResponse(
         request=request,

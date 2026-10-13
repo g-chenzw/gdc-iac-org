@@ -37,12 +37,14 @@ data:
           "redirectUris": [
             "*",
             "https://WORKSTATION_FQDN_PLACEHOLDER/*",
+            "http://localhost:8080/*",
             "http://localhost:8081/*",
             "http://localhost:8082/*"
           ],
           "webOrigins": [
             "*",
             "https://WORKSTATION_FQDN_PLACEHOLDER",
+            "http://localhost:8080",
             "http://localhost:8081",
             "http://localhost:8082"
           ]
