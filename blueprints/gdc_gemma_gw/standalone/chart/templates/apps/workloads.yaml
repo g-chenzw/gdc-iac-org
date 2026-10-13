@@ -59,7 +59,14 @@ spec:
         - name: GATEWAY_TIMEOUT
           value: '300.0'
         - name: MODEL_ROUTING_CONFIG
+          {{- if .Values.apps.modelRoutingConfig }}
+          value: {{ .Values.apps.modelRoutingConfig | quote }}
+          {{- else if eq (.Values.apps.activeFramework | default "ollama") "vllm" }}
+          value: '{"gemma4:26b": "http://vllm-26b-vllm-service:8000", "gemma4:31b": "http://vllm-31b-vllm-service:8000", "*": "http://vllm-26b-vllm-service:8000"}'
+          {{- else }}
           value: '{"gemma4:26b": "http://ollama-26b:11434", "gemma4:31b": "http://ollama-31b:11434", "*": "http://ollama-26b:11434"}'
+          {{- end }}
+
         resources:
           requests:
             cpu: 100m

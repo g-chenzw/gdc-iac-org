@@ -1,10 +1,11 @@
-{{- if .Values.persistence.enabled -}}
+{{- if and .Values.apps.enabled .Values.persistence.enabled -}}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "ollama.fullname" . }}-pvc
+  namespace: {{ include "ollama.namespace" . }}
   labels:
-    app.kubernetes.io/name: {{ include "ollama.name" . }}
+    {{- include "ollama.labels" . | nindent 4 }}
 spec:
   accessModes:
     {{- range .Values.persistence.accessModes }}
@@ -17,3 +18,4 @@ spec:
   storageClassName: {{ .Values.persistence.storageClassName | quote }}
   {{- end }}
 {{- end }}
+

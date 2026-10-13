@@ -23,8 +23,9 @@ echo "Starting CI/CD pre-deployment checks..."
 echo "================================================="
 
 # Loop through all core charts and blueprint pattern wrapper charts
-for chart in charts/* blueprints/patterns/*/chart blueprints/gdc_gemma_gw/*/chart; do
+for chart in charts/* blueprints/patterns/*/chart blueprints/gdc_gemma_gw/*/chart blueprints/gdc_gemma_gw/blueprints/*; do
   if [ -d "$chart" ] && [ -f "$chart/Chart.yaml" ]; then
+
     echo ""
     echo "================================================="
     echo "Testing Chart: $chart"

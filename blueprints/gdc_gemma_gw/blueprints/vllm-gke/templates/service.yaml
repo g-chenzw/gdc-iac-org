@@ -1,7 +1,11 @@
+{{- if .Values.apps.enabled -}}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "vllm.fullname" . }}-service
+  namespace: {{ include "vllm.namespace" . }}
+  labels:
+    {{- include "vllm.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
   ports:
@@ -12,3 +16,5 @@ spec:
   selector:
     app.kubernetes.io/name: {{ include "vllm.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+

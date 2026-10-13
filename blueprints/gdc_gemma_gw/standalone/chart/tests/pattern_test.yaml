@@ -23,3 +23,13 @@ tests:
       - isKind:
           of: Deployment
         documentIndex: 0
+  - it: should switch MODEL_ROUTING_CONFIG to vLLM services when apps.activeFramework is vllm
+    set:
+      apps.activeFramework: vllm
+    template: templates/apps/workloads.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[3].value
+          value: '{"gemma4:26b": "http://vllm-26b-vllm-service:8000", "gemma4:31b": "http://vllm-31b-vllm-service:8000", "*": "http://vllm-26b-vllm-service:8000"}'
+        documentIndex: 0
+
