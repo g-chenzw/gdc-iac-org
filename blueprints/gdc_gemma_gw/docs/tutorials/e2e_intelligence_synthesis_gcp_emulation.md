@@ -161,6 +161,9 @@ sed -e "s|REGISTRY_HOST_PLACEHOLDER|${REGISTRY_HOST}|g" \
 # cannot schedule pods and /api/chat will return 502 Bad Gateway.
 kubectl create serviceaccount gemma-client-sa -n "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 kubectl create secret generic gemma-client-db-credentials \
+  --from-literal=username=postgres \
+  --from-literal=password=password \
+  --from-literal=db_name=postgres \
   --from-literal=connection_string="postgresql://postgres:password@postgres-svc:5432/postgres" \
   -n "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 

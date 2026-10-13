@@ -282,4 +282,66 @@ Refer to the [GDC Testing Methodology](docs/testing-methodology.md) for complete
 
 All Gemma Gateway and Gemma Client components include standardized Helm charts (`blueprints/ollama-gke`, `blueprints/vllm-gke`, `standalone/chart`, and `gemma-client/chart`) compatible with the `gdc-iac-org` layered Helmfile orchestration (`foundations/releases/5-workload-factory`).
 - **Zonal Managed Databases (`Stage 2: 2-resources`)**: Provisioned via core `charts/gdc-dbs` (`gdc.enabled: false` by default in `gemma-client/chart`).
-- **User Cluster Workloads (`Stage 5: 5-workload-factory`)**: Deployed via Helmfile or `helm upgrade --install` with `apps.enabled: true`.
+- **Shared/User Cluster GPU Node Pools (`Stage 3: 3-clusters`)**: Provisioned via `charts/gdc-clusters` with `hgx-h200-1g` (NVIDIA H200 141GB) node pools (`pool: gpu-moe` and `pool: gpu-dense`).
+- **Cluster Workloads (`Stage 5: 5-workload-factory`)**: Declared under `projects[].resources.patterns[]` in `foundations/bases/environments/<env>/zone1/tenant-1.yaml` using `values_files` to load `values-gdc.yaml`:
+
+```yaml
+              patterns:
+                - name: "vllm-26b"
+                  pattern: "gdc-gemma-vllm-26b"
+                  chart_path: "../../../blueprints/gdc_gemma_gw/blueprints/vllm-gke"
+                  namespace: "gemma-inference"
+                  registry: "harbor.gdc.local/gemma-repo"
+                  deploy_gdc_resources: false
+                  deploy_apps: true
+                  values_files:
+                    - "../../../blueprints/gdc_gemma_gw/blueprints/vllm-gke/values-gdc.yaml"
+                  values:
+                    model:
+                      name: "/models/gemma-4-26B-A4B-it-weights"
+                      servedModelName: "gemma4:26b"
+                    nodeSelector:
+                      pool: "gpu-moe"
+
+                - name: "vllm-31b"
+                  pattern: "gdc-gemma-vllm-31b"
+                  chart_path: "../../../blueprints/gdc_gemma_gw/blueprints/vllm-gke"
+                  namespace: "gemma-inference"
+                  registry: "harbor.gdc.local/gemma-repo"
+                  deploy_gdc_resources: false
+                  deploy_apps: true
+                  values_files:
+                    - "../../../blueprints/gdc_gemma_gw/blueprints/vllm-gke/values-gdc.yaml"
+                  values:
+                    model:
+                      name: "/models/gemma-4-31B-it-weights"
+                      servedModelName: "gemma4:31b"
+                    persistence:
+                      existingClaim: "vllm-26b-vllm-weights"
+                    nodeSelector:
+                      pool: "gpu-dense"
+
+                - name: "gemma-gateway"
+                  pattern: "gdc-gemma-gateway"
+                  chart_path: "../../../blueprints/gdc_gemma_gw/standalone/chart"
+                  namespace: "gemma-inference"
+                  registry: "harbor.gdc.local/gemma-repo"
+                  deploy_gdc_resources: false
+                  deploy_apps: true
+                  values:
+                    apps:
+                      activeFramework: "vllm"
+
+                - name: "gemma-client"
+                  pattern: "gdc-gemma-client"
+                  chart_path: "../../../blueprints/gdc_gemma_gw/gemma-client/chart"
+                  namespace: "mellons-prj"
+                  registry: "harbor.gdc.local/gemma-repo"
+                  deploy_gdc_resources: false
+                  deploy_apps: true
+                  values:
+                    apps:
+                      gatewayUrl: "http://gemma-gateway.gemma-inference.svc.cluster.local/v1"
+                      hostnames: ["app.gdc.local"]
+```
+

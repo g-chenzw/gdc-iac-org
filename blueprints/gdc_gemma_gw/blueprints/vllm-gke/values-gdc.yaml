@@ -1,5 +1,27 @@
-# GDC air-gapped (GDC-ag) Production Values Override
-# Purpose: Enforces strict GDC-ag SAN persistent storage parameters.
+# GDC air-gapped (GDC-ag) Production Values Override (Target Hardware: NVIDIA H200 141GB HBM3e)
+# Purpose: Enforces GDC-ag Harbor image registry, local PVC model path, 32768 context window on H200,
+#          host RAM sizing for 52GB-62GB BF16 weight loading, SAN ReadWriteMany storage, and H200 node pool selectors.
+
+image:
+  repository: "harbor.gdc.local/gemma-repo/vllm-openai" # Override via --set image.repository="${REGISTRY_HOST}/vllm-openai"
+  tag: "v1.0.0"                                         # Override via --set image.tag="${TAG}"
+  pullPolicy: IfNotPresent
+
+model:
+  name: "/models/gemma-4-26B-A4B-it-weights" # Override with "/models/gemma-4-31B-it-weights" for the vllm-31b release
+  servedModelName: "gemma4:26b"              # Override with "gemma4:31b" for the vllm-31b release
+  maxModelLen: 32768                         # Production context window on NVIDIA H200 (141GB HBM3e VRAM)
+  gpuMemoryUtilization: 0.90
+  tensorParallelSize: 1                      # Both 26B (~52GB BF16) and 31B (~62GB BF16) fit on a single 141GB H200 GPU (set to 2 only if sharding across multiple H200s for higher concurrency)
+
+resources:
+  limits:
+    gpu: 1                                   # 1x NVIDIA H200 (141GB) holds full BF16 weights + 65GB+ KV cache
+    nvidia.com/gpu: 1
+    memory: "96Gi"                           # Sized above 62GB BF16 checkpoint size to prevent host cgroup OOMKilled during safetensors load
+  requests:
+    cpu: "8000m"
+    memory: "64Gi"
 
 persistence:
   enabled: true
@@ -9,7 +31,8 @@ persistence:
   size: 150Gi
 
 nodeSelector:
-  pool: gpu-moe # Default to MoE node pool, can be overridden via helm --set nodeSelector.pool=gpu-dense
+  cloud.google.com/gke-accelerator: null # Clear GKE L4 label inherited from values.yaml so pods schedule on GDC-ag H200 nodes
+  pool: gpu-moe                          # Default to H200 MoE node pool; override via --set nodeSelector.pool=gpu-dense
 
 tolerations:
 - key: "nvidia.com/gpu"

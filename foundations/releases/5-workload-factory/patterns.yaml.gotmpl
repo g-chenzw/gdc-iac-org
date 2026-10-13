@@ -29,8 +29,11 @@ templates:
 releases:
   {{- range $tenantName, $tenantConfig := $envData.gdc_tenants }}
     {{- $patternsBasePath := $vals | get "gdc_patterns_base_path" "../../../blueprints/patterns" }}
+    {{- $globalProjects := ($tenantConfig | get "global" dict) | get "projects" list }}
+    {{- $zonalProjects := $tenantConfig | get "projects" list }}
+    {{- $allProjects := concat $globalProjects $zonalProjects }}
 
-    {{- range $project := $tenantConfig.global.projects }}
+    {{- range $project := $allProjects }}
       {{- if and $project.resources (hasKey $project.resources "patterns") }}
         {{- range $pattern := $project.resources.patterns }}
           {{- $patternId := $pattern | get "pattern" "" }}
@@ -47,6 +50,11 @@ releases:
         inherit:
           - template: pattern-template
         values:
+          {{- if hasKey $pattern "values_files" }}
+          {{- range $vf := $pattern.values_files }}
+          - {{ $vf | quote }}
+          {{- end }}
+          {{- end }}
           - global:
               projectId: {{ $project.name | quote }}
               namespace: {{ $pattern | get "namespace" $project.name | quote }}
@@ -69,3 +77,4 @@ releases:
       {{- end }}
     {{- end }}
   {{- end }}
+

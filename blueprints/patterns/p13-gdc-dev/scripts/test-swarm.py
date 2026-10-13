@@ -84,20 +84,26 @@ def call_endpoint(endpoint, payload, timeout=300, host_header=None, insecure=Tru
     headers = {"Content-Type": "application/json", "X-User-ID": "test-engineer"}
     if host_header:
         headers["Host"] = host_header
-    req = urllib.request.Request(
-        endpoint,
-        data=data,
-        headers=headers
-    )
     context = ssl._create_unverified_context() if (insecure or endpoint.startswith("https://")) else None
-    with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        req = urllib.request.Request(endpoint, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        # On Cloud Workstations where IPv6 loopback (::1) is unavailable, 'localhost'
+        # raises [Errno 99] Cannot assign requested address. Retry over explicit IPv4 127.0.0.1.
+        if "://localhost:" in endpoint or "://localhost/" in endpoint:
+            ipv4_endpoint = endpoint.replace("://localhost", "://127.0.0.1", 1)
+            req = urllib.request.Request(ipv4_endpoint, data=data, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        raise
 
 def main():
     parser = argparse.ArgumentParser(description="Test Pattern 13 Phase 4 Multi-Agent Swarm")
-    default_endpoint = os.environ.get("GDC_DEV_ENDPOINT", "http://localhost:8080/instances/default-workspace/ai-chat")
+    default_endpoint = os.environ.get("GDC_DEV_ENDPOINT", "http://127.0.0.1:8080/instances/default-workspace/ai-chat")
     parser.add_argument("--endpoint", default=default_endpoint,
-                        help="GDC Dev AI Chat endpoint (default: $GDC_DEV_ENDPOINT or http://localhost:8080/instances/default-workspace/ai-chat)")
+                        help="GDC Dev AI Chat endpoint (default: $GDC_DEV_ENDPOINT or http://127.0.0.1:8080/instances/default-workspace/ai-chat)")
     parser.add_argument("--host-header", default=os.environ.get("GDC_DEV_HOST_HEADER", None),
                         help="Custom Host header (e.g. 'dev.gdc.local') when testing directly against LoadBalancer VIP")
     parser.add_argument("--insecure", "-k", action="store_true", default=True,

@@ -46,8 +46,18 @@
       "properties": {
         "enabled": {
           "type": "boolean"
+        },
+        "activeFramework": {
+          "type": "string"
+        },
+        "ollamaModelVariant": {
+          "type": "string"
+        },
+        "modelRoutingConfig": {
+          "type": "string"
         }
       }
     }
   }
 }
+
