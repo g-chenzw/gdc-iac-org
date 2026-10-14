@@ -2,6 +2,7 @@
 
 > **Document ID:** `GUIDE-GDC-AI-BLUEPRINT-E2E-IAC`  
 > **Target Environment:** Google Distributed Cloud Air-Gapped (**GDC-ag**) Production Organization  
+> **Companion Staging Guide:** [AI-Enabled Blueprint E2E Test Guide (GCP Staging & Development)](./ai_enabled_e2e_gcp_staging_guide.md)  
 > **Orchestration Framework:** `gdc-iac-org` Multi-Stage Helmfile Foundations (`0-bootstrap` $\rightarrow$ `5-workload-factory`)  
 > **Integrated Blueprints:**  
 > - **Stage 2 Zonal Managed Infrastructure:** GDC Managed Harbor (`charts/gdc-harbors`), Zonal HA PostgreSQL + `pgvector` (`charts/gdc-dbs`), and GDC Native Object Storage Buckets (`charts/gdc-buckets`)  
@@ -306,7 +307,10 @@ prd:
                 values:
                   apps:
                     activeFramework: "vllm"
-                    enableOidc: "true"
+                    # enableOidc=false + adminRequireOidc=true enforces Keycloak OIDC on the Admin Control Plane
+                    # while allowing in-cluster backends (gemma-client & p13-gdc-dev) to forward X-User-ID
+                    enableOidc: "false"
+                    adminRequireOidc: "true"
                     keycloakUrl: "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
                     envoyInferencePool:
                       enabled: true
@@ -331,9 +335,10 @@ prd:
                 values:
                   apps:
                     enableOidc: "true"
+                    enableGcsUpload: "true"
                     keycloakUrl: "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
                     gatewayUrl: "http://gemma-gateway/v1"
-                    inputBucket: "gemma-rag-bucket"
+                    inputBucket: "gs://gemma-rag-bucket"
                     hostnames:
                       - "intel.gdc.local"
 
@@ -390,6 +395,11 @@ prd:
 All Helmfile commands **must** be executed from the `foundations/` directory (`cd ~/GitHub/gdc-iac-org/foundations`):
 
 ```bash
+cd ~/GitHub/gdc-iac-org
+# Stash any local file-mode or manifest edits before syncing the repository
+git stash 2>/dev/null || true
+git pull
+
 cd ~/GitHub/gdc-iac-org/foundations
 
 # 1. Pre-flight schema and template validation for the 'prd' environment
@@ -418,17 +428,31 @@ helmfile -e prd -l stage=5-workload-factory diff
 helmfile -e prd -l stage=5-workload-factory apply
 ```
 
-### 6.1. Post-Deploy Production Hardening & Initial Database Seeding
+### 6.1. Post-Deploy Production Hardening, Object Storage Verification & Initial Database Seeding
 
-Once Stage 5 completes, lock down simulated OIDC on `gdc-dev` for production and seed the initial operational readiness tables into the Zonal HA PostgreSQL instance:
+Once Stage 5 completes, verify that the GDC Object Storage bucket (`gemma-rag-bucket`) and `gemma-client-sa` bindings are active, configure `gemma-gateway` and `gdc-dev` OIDC header propagation, and seed the operational readiness and `files`/`chats`/`messages` schema into the Zonal HA PostgreSQL instance:
 
 ```bash
-# 1. Enforce strict Keycloak OIDC on gdc-dev (disable simulated OIDC fallback in production)
-kubectl patch configmap gdc-dev-oidc-config -n gdc-dev \
-  --type merge -p '{"data":{"AUTH_MODE":"oidc","ALLOW_SIMULATED_OIDC":"false"}}'
-kubectl rollout restart deployment/gdc-dev-landing-page -n gdc-dev
+# 1. Verify GDC Object Storage bucket ('gemma-rag-bucket') exists (reconcile Stage 2 if missing)
+kubectl get bucket gemma-rag-bucket -n gemma-inference >/dev/null 2>&1 || \
+  helmfile -e prd -l stage=2-resources apply
 
-# 2. Seed initial tactical readiness & SITREP schema into the PostgreSQL database
+# 2. Ensure gemma-gateway enforces Admin OIDC while accepting X-User-ID from in-cluster backends
+kubectl set env deployment/gemma-gateway -n gemma-inference \
+  ENABLE_OIDC="false" \
+  ADMIN_REQUIRE_OIDC="true"
+kubectl rollout status deployment/gemma-gateway -n gemma-inference --timeout=90s
+
+# 3. Configure gdc-dev OIDC ConfigMap (gdc-dev-oidc-auth-config):
+#    - Use ALLOW_SIMULATED_OIDC="false" when traffic traverses the upstream GDC OIDC Reverse Proxy (which injects X-Forwarded-User).
+#    - If testing directly via 'kubectl port-forward' from an operator workstation without an upstream OIDC proxy,
+#      set ALLOW_SIMULATED_OIDC="true" and HEADER_USER_KEY="X-User-ID" to avoid '{"error": "Missing verified OIDC identity header", "status": 401}':
+kubectl patch configmap gdc-dev-oidc-auth-config -n gdc-dev \
+  --type merge -p '{"data":{"AUTH_MODE":"oidc","ALLOW_SIMULATED_OIDC":"false","HEADER_USER_KEY":"X-Forwarded-User"}}'
+kubectl rollout restart deployment/gdc-dev-landing-page deployment/gdc-dev-operator -n gdc-dev
+kubectl rollout status deployment/gdc-dev-landing-page -n gdc-dev --timeout=90s
+
+# 4. Seed initial chat/files tables + tactical readiness & SITREP schema into the PostgreSQL database
 DB_POD=$(kubectl get pods -n gemma-inference -l app=postgres -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -i "${DB_POD}" -n gemma-inference -- psql -U postgres -d postgres < ../blueprints/gdc_gemma_gw/test-data/seed_readiness_db.sql
 ```
@@ -497,16 +521,33 @@ for label, prompt in [
 kubectl logs -n gemma-inference deploy/gemma-gateway --tail=200 | grep -E "Classifier|Routing|envoy-inference-pool|completions"
 ```
 
-### 7.3. Verify E2E Joint Intelligence Console, Chat Client & `gdc-dev` Swarm
+### 7.3. Interactive Browser Verification Matrix Across All Production Endpoints
 
-1. **Joint Intelligence E2E Tutorial & Standard Chat Client (`https://intel.gdc.local`)**:
-   * Navigate to `https://intel.gdc.local` (Gateway API path) and `https://intel-ingress.gdc.local` (Ingress path).
-   * Sign in via Keycloak SSO (`charlie` / `password` or `alice` / `password`).
-   * Verify **Kafka Multi-Domain Sensor Ingestion (`⚡ Ingest Sensor Pings`)**, **Grounded RAG Tactical Synthesis (`SITREP-2026-08-SEC9-CONVOY`)**, and **Agentic Read-Only SQL Audit**.
-   * Click **Switch to Standard Gemma Client** in the top navigation bar to validate standard multi-turn chat and document uploads on the same deployment.
-2. **`gdc-dev` Developer IDE (`https://dev.gdc.local`) & Sovereign Admin Console (`https://admin.dev.gdc.local`)**:
-   * Open `https://admin.dev.gdc.local` with an `admin` / `gdc-admin` Keycloak identity to inspect live PVC storage (`gdc-block-storage`), publish a cluster broadcast banner, and monitor live AI Swarm telemetry.
-   * Open `https://dev.gdc.local/instances/default-workspace` or run the automated 10-stage CLI swarm verification harness:
+1. **`https://ai-gateway.gdc.local` (or Port `8080` — `🧠 Gemma 4 Gateway Control Plane`)**:
+   * **OIDC Authentication Bar (Top Strip)**: Click **`🔑 Keycloak SSO Login (/auth)`** (`charlie` / `password`) or **`🛡️ One-Click Admin (charlie)`** to sign in (`Role: ADMIN`).
+   * **Card 1 — `⚡ Live System Performance & Telemetry`**: Verify live `CPU Load` and `GPU Core Load` gauges, `Tokens Out/Sec`, `Active DB Pools`, and the `VRAM Consumption` progress bar.
+   * **Card 2 — `🎛️ Gateway Parameters Override`**: Adjust `Temperature`, `Top-P`, `Max Vision Tokens (Vision Budgets)`, or **`Model Variant Hot-Swap`** (`Gemma 4 26B A4B (MoE)` vs. `Gemma 4 31B (Dense)`), then click **`Save Gateway Configuration`**.
+   * **Card 3 — `🕵️ Active User Session Oversight & Kill-Switch`**: Displays `User ID`, `Client IP`, `Status`, `Last Active`, and the **`Kill Session`** button.
+     > **Note on When Users Appear in `Active User Session Oversight & Kill-Switch`:** Logging into Keycloak on `https://intel.gdc.local` (`alice`) or `https://intel-ingress.gdc.local` (`charlie`) authenticates the browser with the frontend, but `gemma-gateway` records a session in this table **only when that user submits an AI inference request** (`/v1/chat/completions`) via **Tactical Chat**, **All-Source Intel (RAG)**, **Operational Readiness (SQL)**, or the **GDC Dev AI Swarm**.
+   * **Card 4 — `👥 User Access Blocklist Management`**: Enter a `User ID` (e.g., `alice`) and click **`Block User`** to test instant `403 Forbidden` revocation, then click **`Unblock`** to restore access.
+
+2. **`https://intel.gdc.local` (Gateway API / Port `8081`) & `https://intel-ingress.gdc.local` (Ingress / Port `8082`) — `Joint Intelligence & Readiness Console` / `Gemma Client`**:
+   * Open `https://intel.gdc.local` (log in via **Sign In with Keycloak SSO** as `alice` / `password`) and `https://intel-ingress.gdc.local` (log in as `charlie` / `password`) to verify identical behavior across **Kubernetes Gateway API** (`HTTPRoute`) and **Kubernetes Ingress**.
+   * **Top Navigation Bar Controls**:
+     * **Mode Switcher (`🛡️ Intel Console` | `💬 Gemma Client`)**: Click **`🛡️ Intel Console`** for the 4-tab Joint Intelligence Console, or click **`💬 Gemma Client`** to switch to the standard multi-turn chat and document RAG upload view (`Upload File` $\rightarrow$ `gs://gemma-rag-bucket`) without redeploying any pods.
+     * **Model Routing Dropdown**: Select **`Gemma 4 Gateway (Auto)`** (automatic Tier 1 / Tier 2 complexity routing), **`Gemma 4 26B A4B (MoE)`** (manual Tier 1 pin), or **`Gemma 4 31B (Dense)`** (manual Tier 2 pin). When **`Gemma 4 Gateway (Auto)`** is active, after a response completes, a routing badge (`→ gemma4:26b` or `→ gemma4:31b`) appears next to the dropdown showing which model tier executed the prompt.
+     * **`🧠 CoT` Checkbox**: Toggle Chain-of-Thought reasoning traces on or off.
+   * **The 4 Tabs in `🛡️ Intel Console`**:
+     * **Tab 1 — `Tactical Feeds (Kafka)` (`Live Stream`)**: Inspect multi-domain telemetry (`LAND`, `AIR`, `SEA`, `SPACE`, `CYBER`) and click **`⚡ Ingest Sensor Pings`** to inject fresh Kafka sensor frames.
+     * **Tab 2 — `All-Source Intel (RAG)` (`SITREPs`)**: Click one of the **`Suggested Inquiries`** pills (or type a custom query) and click **`Synthesize`** to execute pgvector semantic retrieval and generate a **`Tactical Intelligence Synthesis`** with `[SITREP-...]` citations and a `Model: ...` badge.
+     * **Tab 3 — `Operational Readiness (SQL)` (`Agentic`)**: Click a **`Command Questions`** pill (or enter a readiness question) and click **`Audit`** to generate and execute a read-only PostgreSQL query and executive readiness summary. Verify SQL guardrails by submitting `DROP TABLE military_units;` and confirming it returns **`Rejected by Security Gate`**.
+     * **Tab 4 — `Tactical Chat` (`Gemma 4`)**: Submit a chat prompt as `alice` on `intel.gdc.local` and a chat prompt as `charlie` on `intel-ingress.gdc.local`. Then return to **`https://ai-gateway.gdc.local`** and confirm that **both `alice` and `charlie` now appear** in the **`🕵️ Active User Session Oversight & Kill-Switch`** table.
+
+3. **`https://admin.dev.gdc.local` (or Port `8083` — `gdc-dev` Sovereign Admin & Telemetry Console)**:
+   * Sign in with an `admin` / `gdc-admin` Keycloak OIDC identity to inspect live PVC storage (`gdc-block-storage`), observe the initial 5 seeded baseline events, publish a real-time **Cluster Broadcast Banner**, and monitor live AI Swarm telemetry.
+
+4. **`https://dev.gdc.local` (or Port `8084` — `gdc-dev` Developer IDE & Multi-Agent Swarm)**:
+   * Open `https://dev.gdc.local/instances/default-workspace`, verify that the broadcast banner published on the Admin Console appears at the top of the IDE, and run a coding prompt in **`🤖 GDC Dev AI Swarm`** (`💻 Coder` or `🐝 Swarm`) or execute the automated 10-stage CLI swarm verification harness:
      ```bash
      ./blueprints/patterns/p13-gdc-dev/scripts/test-swarm.py \
        --endpoint "https://dev.gdc.local/instances/default-workspace/ai-chat" \
