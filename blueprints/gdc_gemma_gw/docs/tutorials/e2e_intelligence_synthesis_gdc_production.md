@@ -4,7 +4,6 @@
 > **Document ID:** `TUT-GDC-E2E-INTEL-SYNTHESIS`  
 > **Version:** 1.1  
 > **Target Environment:** Google Distributed Cloud Air-Gapped (GDC-ag) Production Rack  
-> **Companion Emulation Guide:** [Testing & Demonstrating on GCP GKE Emulation Environment](./e2e_intelligence_synthesis_gcp_emulation.md)  
 > **Integrated Blueprints:** P4 (Kafka Event Stream), P6 (Resilient RAG Agent), P7 (Agentic Data Analyst), P5/Gateway (`gdc_gemma_gw`), P10/Client (`gemma-client`), P12 (Keycloak OIDC)  
 > **Mission Scenario:** *Operation Vanguard Shield* — Multi-Domain Operations (MDO) across Land, Air, Sea, Space, and Cyberspace.
 

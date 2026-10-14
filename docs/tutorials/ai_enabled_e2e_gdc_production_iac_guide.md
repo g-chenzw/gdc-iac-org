@@ -2,7 +2,6 @@
 
 > **Document ID:** `GUIDE-GDC-AI-BLUEPRINT-E2E-IAC`  
 > **Target Environment:** Google Distributed Cloud Air-Gapped (**GDC-ag**) Production Organization  
-> **Companion Staging Guide:** [AI-Enabled Blueprint E2E Test Guide (GCP Staging & Development)](./ai_enabled_e2e_gcp_staging_guide.md)  
 > **Orchestration Framework:** `gdc-iac-org` Multi-Stage Helmfile Foundations (`0-bootstrap` $\rightarrow$ `5-workload-factory`)  
 > **Integrated Blueprints:**  
 > - **Stage 2 Zonal Managed Infrastructure:** GDC Managed Harbor (`charts/gdc-harbors`), Zonal HA PostgreSQL + `pgvector` (`charts/gdc-dbs`), and GDC Native Object Storage Buckets (`charts/gdc-buckets`)  
