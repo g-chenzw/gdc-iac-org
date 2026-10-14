@@ -61,10 +61,39 @@ async def generate_chat_response(
 
     if only_use_sources:
         system_instruction += " You must answer the user's question STRICTLY based on the provided documents and images. If the answer is not in the provided content, say 'I cannot answer this based on the provided sources.'"
-    
+    else:
+        system_instruction += (
+            " The user has disabled 'Strictly use provided sources' (general chat mode is active). "
+            "You MUST answer the user's question using your general knowledge whenever the answer is not found in the uploaded documents, "
+            "and you MUST ignore any prior refusal ('I cannot answer this based on the provided sources') from earlier turns."
+        )
+
+    # Fetch and inject file contents into the top-level system context (avoiding mid-conversation system role messages)
+    file_context = ""
+    for file_id in (file_ids or []):
+        row = await db.fetch_one("SELECT filename, gcs_path, content_type FROM files WHERE id = $1", file_id)
+        if row:
+            filename = row['filename']
+            gcs_path = row['gcs_path']
+            try:
+                file_bytes = get_blob_content(gcs_path)
+                text_content = file_bytes.decode("utf-8", errors="ignore")
+                file_context += f"\n--- Document: {filename} ---\n{text_content}\n--- End Document ---\n"
+            except Exception as e:
+                print(f"Error loading file {filename}: {e}")
+
+    if file_context:
+        if only_use_sources:
+            system_instruction += f"\n\nSTRICT SOURCE GROUNDING CONTEXT (answer ONLY from these documents):\n{file_context}"
+        else:
+            system_instruction += (
+                f"\n\nOPTIONAL REFERENCE DOCUMENTS (use if relevant to the user's prompt; "
+                f"if the prompt asks about anything outside these documents, answer normally using your general knowledge):\n{file_context}"
+            )
+
     openai_history.append({"role": "system", "content": system_instruction})
 
-    # Reconstruct history (avoiding consecutive duplicate 'user' messages)
+    # Reconstruct history (avoiding consecutive duplicate 'user' messages and stripping stale source-only refusals when general mode is active)
     history_to_append = history
     if history and history[-1].role == "user" and history[-1].content == message:
         history_to_append = history[:-1]
@@ -75,25 +104,9 @@ async def generate_chat_response(
         normalized_role = "assistant" if msg.role == "model" else msg.role
         if normalized_role not in ("system", "user", "assistant"):
             normalized_role = "user"
+        if not only_use_sources and normalized_role == "assistant" and "cannot answer this based on the provided sources" in msg.content.lower():
+            continue
         openai_history.append({"role": normalized_role, "content": msg.content})
-        
-    # Fetch and inject file contents into prompt context
-    file_context = ""
-    for file_id in file_ids:
-        row = await db.fetch_one("SELECT filename, gcs_path, content_type FROM files WHERE id = $1", file_id)
-        if row:
-            filename = row['filename']
-            gcs_path = row['gcs_path']
-            content_type = row['content_type']
-            try:
-                file_bytes = get_blob_content(gcs_path)
-                text_content = file_bytes.decode("utf-8", errors="ignore")
-                file_context += f"\n--- Document: {filename} ---\n{text_content}\n--- End Document ---\n"
-            except Exception as e:
-                print(f"Error loading file {filename}: {e}")
-
-    if file_context:
-        openai_history.append({"role": "system", "content": f"Here is the ground truth context from uploaded files:\n{file_context}"})
 
     # Append user message
     openai_history.append({"role": "user", "content": message})
