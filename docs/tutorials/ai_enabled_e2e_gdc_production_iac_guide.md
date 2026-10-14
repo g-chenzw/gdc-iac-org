@@ -516,7 +516,9 @@ for label, prompt in [
         headers={"Content-Type": "application/json"}
     )
     with opener.open(req, timeout=60) as resp:
-        print(f"\n[{label}] Status: {resp.status} | X-Model-Used: {resp.headers.get(\"X-Model-Used\")} | X-Model-Tier: {resp.headers.get(\"X-Model-Tier\")}")
+        model_used = resp.headers.get("X-Model-Used")
+        model_tier = resp.headers.get("X-Model-Tier")
+        print(f"\n[{label}] Status: {resp.status} | X-Model-Used: {model_used} | X-Model-Tier: {model_tier}")
 '
 
 # Inspect filtered gateway + epp routing logs
