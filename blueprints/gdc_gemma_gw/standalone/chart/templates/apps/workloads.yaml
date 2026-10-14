@@ -66,21 +66,27 @@ spec:
           value: {{ .Values.apps.dcgmMetricsUrl | default "" | quote }}
         - name: ENABLE_OIDC
           value: {{ .Values.apps.enableOidc | default false | quote }}
+        - name: ADMIN_REQUIRE_OIDC
+          value: {{ .Values.apps.adminRequireOidc | default (.Values.apps.enableOidc | default true) | quote }}
         - name: KEYCLOAK_URL
           value: {{ .Values.apps.keycloakUrl | default "http://keycloak-svc:8080/auth/realms/gdc-rag-realm" | quote }}
         - name: REDIS_URL
           value: {{ .Values.apps.redisUrl | default "" | quote }}
         - name: GATEWAY_STATE_FILE
           value: {{ .Values.apps.gatewayStateFile | default "/tmp/gemma_gateway_state.json" | quote }}
+        {{- $rawEnvoyUrl := "" }}
+        {{- if .Values.apps.envoyInferencePool }}
+        {{- $rawEnvoyUrl = coalesce .Values.apps.envoyInferencePool.serviceUrl .Values.apps.envoyInferencePool.url "" }}
+        {{- end }}
+        {{- $envoyUrl := ($rawEnvoyUrl | default "http://gemma-envoy-inference-pool:80") | trimSuffix "/" | trimSuffix "/v1" | trimSuffix "/" }}
         - name: ENVOY_INFERENCE_POOL_ENABLED
           value: {{ (and .Values.apps.envoyInferencePool .Values.apps.envoyInferencePool.enabled) | default false | quote }}
         - name: ENVOY_INFERENCE_POOL_URL
-          value: {{ (and .Values.apps.envoyInferencePool .Values.apps.envoyInferencePool.serviceUrl) | default "http://gemma-envoy-inference-pool:80" | quote }}
+          value: {{ $envoyUrl | quote }}
         - name: MODEL_ROUTING_CONFIG
           {{- if .Values.apps.modelRoutingConfig }}
           value: {{ .Values.apps.modelRoutingConfig | quote }}
           {{- else if and .Values.apps.envoyInferencePool .Values.apps.envoyInferencePool.enabled }}
-          {{- $envoyUrl := .Values.apps.envoyInferencePool.serviceUrl | default "http://gemma-envoy-inference-pool:80" }}
           value: {{ printf "{\"gemma4:26b\": %q, \"gemma4:31b\": %q, \"*\": %q}" $envoyUrl $envoyUrl $envoyUrl | quote }}
           {{- else if eq (.Values.apps.activeFramework | default "ollama") "vllm" }}
           value: '{"gemma4:26b": "http://vllm-26b-vllm-service:8000", "gemma4:31b": "http://vllm-31b-vllm-service:8000", "*": "http://vllm-26b-vllm-service:8000"}'
@@ -125,6 +131,7 @@ spec:
     name: gdc-platform-gateway
     namespace: gemma-inference
   hostnames:
+  - ai-gateway.gdc.local
   - gemma-gateway.shared-services.gdc.local
   rules:
   - matches:

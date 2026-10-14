@@ -176,6 +176,11 @@ prd:
           - name: "gemma-inference"
             iamrolebindings:
               - role: "project-iam-admin"
+              - role: "project-bucket-admin"
+              - role: "project-bucket-object-admin"
+              - role: "project-bucket-object-admin"
+                subject_name: "gemma-client-sa"
+                subject_kind: "ServiceAccount"
             serviceaccounts:
               - name: "gemma-gateway-ksa"
                 namespace: "gemma-inference"
@@ -307,14 +312,12 @@ prd:
                 values:
                   apps:
                     activeFramework: "vllm"
-                    # enableOidc=false + adminRequireOidc=true enforces Keycloak OIDC on the Admin Control Plane
-                    # while allowing in-cluster backends (gemma-client & p13-gdc-dev) to forward X-User-ID
-                    enableOidc: "false"
+                    enableOidc: "true"
                     adminRequireOidc: "true"
                     keycloakUrl: "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
                     envoyInferencePool:
                       enabled: true
-                      url: "http://gemma-envoy-ai-gateway.gemma-inference.svc.cluster.local/v1"
+                      serviceUrl: "http://gemma-envoy-inference-pool:80"
 
               # 6. Pattern 4 Apache Kafka KRaft Broker & Multi-Domain Telemetry Stream
               - name: "kafka-telemetry"
@@ -336,6 +339,7 @@ prd:
                   apps:
                     enableOidc: "true"
                     enableGcsUpload: "true"
+                    s3Endpoint: "https://objectstorage.gdc.goog"
                     keycloakUrl: "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
                     gatewayUrl: "http://gemma-gateway/v1"
                     inputBucket: "gs://gemma-rag-bucket"
@@ -359,6 +363,8 @@ prd:
                   phase: 3
                   auth:
                     mode: "oidc"
+                    allowSimulatedOidc: "false"
+                    headerUserKey: "X-Forwarded-User"
                   ai:
                     enabled: true
 
@@ -428,34 +434,30 @@ helmfile -e prd -l stage=5-workload-factory diff
 helmfile -e prd -l stage=5-workload-factory apply
 ```
 
-### 6.1. Post-Deploy Production Hardening, Object Storage Verification & Initial Database Seeding
+### 6.1. Post-Deploy Production Object Storage Verification & Initial Database Seeding
 
-Once Stage 5 completes, verify that the GDC Object Storage bucket (`gemma-rag-bucket`) and `gemma-client-sa` bindings are active, configure `gemma-gateway` and `gdc-dev` OIDC header propagation, and seed the operational readiness and `files`/`chats`/`messages` schema into the Zonal HA PostgreSQL instance:
+Once Stage 5 completes, verify that the declarative GDC Object Storage `Bucket` (`gemma-rag-bucket`), `gemma-gateway`, and `gdc-dev` deployments are healthy, and seed the operational readiness and SITREP dataset into the Zonal HA PostgreSQL instance (note: `gemma-client` also initializes all 9 core tables automatically on startup via `gen_random_uuid()`):
 
 ```bash
-# 1. Verify GDC Object Storage bucket ('gemma-rag-bucket') exists (reconcile Stage 2 if missing)
+# 1. Verify GDC Object Storage bucket ('gemma-rag-bucket') exists in the Zonal/Project plane (reconcile Stage 2 if missing)
 kubectl get bucket gemma-rag-bucket -n gemma-inference >/dev/null 2>&1 || \
   helmfile -e prd -l stage=2-resources apply
 
-# 2. Ensure gemma-gateway enforces Admin OIDC while accepting X-User-ID from in-cluster backends
-kubectl set env deployment/gemma-gateway -n gemma-inference \
-  ENABLE_OIDC="false" \
-  ADMIN_REQUIRE_OIDC="true"
-kubectl rollout status deployment/gemma-gateway -n gemma-inference --timeout=90s
+# 2. Verify rollout status across gemma-gateway, gemma-client backend, and gdc-dev
+kubectl rollout status deployment/gemma-gateway deployment/backend -n gemma-inference --timeout=90s
+kubectl rollout status deployment/gdc-dev-landing-page deployment/gdc-dev-operator -n gdc-dev --timeout=90s
 
-# 3. Configure gdc-dev OIDC ConfigMap (gdc-dev-oidc-auth-config):
-#    - Use ALLOW_SIMULATED_OIDC="false" when traffic traverses the upstream GDC OIDC Reverse Proxy (which injects X-Forwarded-User).
-#    - If testing directly via 'kubectl port-forward' from an operator workstation without an upstream OIDC proxy,
-#      set ALLOW_SIMULATED_OIDC="true" and HEADER_USER_KEY="X-User-ID" to avoid '{"error": "Missing verified OIDC identity header", "status": 401}':
-kubectl patch configmap gdc-dev-oidc-auth-config -n gdc-dev \
-  --type merge -p '{"data":{"AUTH_MODE":"oidc","ALLOW_SIMULATED_OIDC":"false","HEADER_USER_KEY":"X-Forwarded-User"}}'
-kubectl rollout restart deployment/gdc-dev-landing-page deployment/gdc-dev-operator -n gdc-dev
-kubectl rollout status deployment/gdc-dev-landing-page -n gdc-dev --timeout=90s
-
-# 4. Seed initial chat/files tables + tactical readiness & SITREP schema into the PostgreSQL database
-DB_POD=$(kubectl get pods -n gemma-inference -l app=postgres -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -i "${DB_POD}" -n gemma-inference -- psql -U postgres -d postgres < ../blueprints/gdc_gemma_gw/test-data/seed_readiness_db.sql
+# 3. Seed initial tactical readiness & SITREP dataset into PostgreSQL (supports both in-cluster postgres pod and managed GDC DBCluster)
+DB_POD=$(kubectl get pods -n gemma-inference -l app=postgres -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+if [ -n "${DB_POD}" ]; then
+  kubectl exec -i "${DB_POD}" -n gemma-inference -- psql -U postgres -d postgres < ../blueprints/gdc_gemma_gw/test-data/seed_readiness_db.sql
+else
+  DB_URL=$(kubectl get secret gemma-client-db-credentials -n gemma-inference -o jsonpath='{.data.connection_string}' | base64 -d)
+  psql "${DB_URL}" < ../blueprints/gdc_gemma_gw/test-data/seed_readiness_db.sql
+fi
 ```
+
+> **Note for Direct `kubectl port-forward` Operator Testing (Bypassing Upstream OIDC Proxy):** In production, `gdc-dev` sets `auth.allowSimulatedOidc: "false"` and `auth.headerUserKey: "X-Forwarded-User"` because the upstream GDC OIDC Reverse Proxy injects `X-Forwarded-User`. If you access `gdc-dev` directly over `kubectl port-forward` without an upstream OIDC proxy, set `auth.allowSimulatedOidc: "true"` and `auth.headerUserKey: "X-User-ID"` under `gdc-dev-platform.values` in `zone1/tenant-1.yaml` and re-run `helmfile -e prd -l stage=5-workload-factory apply`.
 
 ---
 

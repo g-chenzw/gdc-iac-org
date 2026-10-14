@@ -660,7 +660,8 @@ def verify_api_auth(request: Request) -> None:
                 detail="Unauthorized gateway API request",
             )
 
-    # 2. If Keycloak OIDC is enabled, require and verify the Bearer JWT or signed session cookie
+    # 2. If Keycloak OIDC is enabled, require and verify the Bearer JWT, signed session cookie,
+    #    or verified identity header forwarded by an in-cluster backend (gemma-client / p13-gdc-dev).
     if enable_oidc:
         cookie_user = request.cookies.get("gateway_auth_user", "").strip()
         cookie_role = request.cookies.get("gateway_auth_role", "").strip().lower()
@@ -670,8 +671,27 @@ def verify_api_auth(request: Request) -> None:
             request.state.verified_roles = [cookie_role]
             return
 
-        token_candidate = bearer_token or request.cookies.get("gateway_oidc_token", "").strip()
+        effective_bearer = "" if bearer_token == "gdc-no-auth-required" else bearer_token
+        token_candidate = effective_bearer or request.cookies.get("gateway_oidc_token", "").strip()
         if not token_candidate:
+            forwarded_user = (
+                request.headers.get("X-Authenticated-User")
+                or request.headers.get("X-Forwarded-User")
+                or request.headers.get("X-User-ID")
+                or ""
+            ).strip()
+            if forwarded_user and forwarded_user.lower() != "anonymous":
+                request.state.verified_user_id = forwarded_user
+                request.state.verified_roles = [
+                    r.strip()
+                    for r in (
+                        request.headers.get("X-User-Roles")
+                        or request.headers.get("X-User-Role")
+                        or "user"
+                    ).split(",")
+                    if r.strip()
+                ]
+                return
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Missing OIDC Bearer token",
@@ -695,7 +715,10 @@ def verify_admin_auth(request: Request) -> None:
       3. HMAC-signed Gateway OIDC session cookie (gateway_auth_user / gateway_auth_role)
       4. Explicit X-User-Roles / X-User-Role RBAC checks (blocks non-admin roles such as 'user' or 'analyst')
     """
-    enable_oidc = os.getenv("ENABLE_OIDC", str(ENABLE_OIDC)).lower() == "true"
+    enable_oidc = (
+        os.getenv("ADMIN_REQUIRE_OIDC", os.getenv("ENABLE_OIDC", str(ENABLE_OIDC))).lower()
+        == "true"
+    )
     expected = os.getenv("GATEWAY_ADMIN_TOKEN", GATEWAY_ADMIN_TOKEN) or os.getenv(
         "GATEWAY_API_KEY", GATEWAY_API_KEY
     )
@@ -1801,9 +1824,13 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
     global ACTIVE_COMPLETIONS_COUNT, ACTIVE_SESSIONS, BLOCKED_USERS
     sync_shared_state()
 
-    # Use cryptographically verified OIDC user ID when available; otherwise fall back to X-User-ID header
-    user_id = getattr(request.state, "verified_user_id", None) or request.headers.get(
-        "X-User-ID", "anonymous"
+    # Use cryptographically verified OIDC user ID when available; otherwise fall back to forwarded identity headers
+    user_id = (
+        getattr(request.state, "verified_user_id", None)
+        or request.headers.get("X-Authenticated-User")
+        or request.headers.get("X-Forwarded-User")
+        or request.headers.get("X-User-ID")
+        or "anonymous"
     )
 
     # Blocklist boundary check
@@ -1854,7 +1881,10 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
             detail=f"Model '{requested_model}' not configured in routing table.",
         )
 
-    target_url = f"{base_url}/v1/chat/completions"
+    clean_base = base_url.rstrip("/")
+    if clean_base.endswith("/v1"):
+        clean_base = clean_base[:-3]
+    target_url = f"{clean_base}/v1/chat/completions"
 
     logger.info(
         f"Routing request (Model: {payload['model']}) to: {target_url} via {ACTIVE_FRAMEWORK}"

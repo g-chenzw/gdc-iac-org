@@ -44,7 +44,8 @@ apps:
   gpuVramTotalGb: "80.0"
   vllmGpuMemoryUtilization: "0.90"
   dcgmMetricsUrl: ""
-  enableOidc: false
+  enableOidc: true
+  adminRequireOidc: true
   keycloakUrl: "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
   redisUrl: ""
   gatewayStateFile: "/tmp/gemma_gateway_state.json"
@@ -52,3 +53,4 @@ apps:
   envoyInferencePool:
     enabled: false
     serviceUrl: "http://gemma-envoy-inference-pool:80"
+    url: ""

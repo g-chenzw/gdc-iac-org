@@ -259,18 +259,16 @@ spec:
       containers:
       - name: operator
         image: {{ include "p13-gdc-dev.registry" . }}/gdc-dev-operator:latest
-        imagePullPolicy: Always
-        env:
-        - name: AUTH_MODE
-          valueFrom:
-            configMapKeyRef:
-              name: gdc-dev-mock-auth-config
-              key: AUTH_MODE
-        - name: MOCK_USER_ID
-          valueFrom:
-            configMapKeyRef:
-              name: gdc-dev-mock-auth-config
-              key: MOCK_USER_ID
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: gdc-dev-oidc-auth-config
+        - configMapRef:
+            name: gdc-dev-ai-config
+            optional: true
+        - configMapRef:
+            name: gdc-dev-agent-config
+            optional: true
         ports:
         - containerPort: 3000
           name: session
@@ -306,12 +304,18 @@ spec:
       containers:
       - name: landing-page
         image: {{ include "p13-gdc-dev.registry" . }}/gdc-dev-landing-page:latest
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8080
         envFrom:
         - configMapRef:
-            name: gdc-dev-mock-auth-config
+            name: gdc-dev-oidc-auth-config
+        - configMapRef:
+            name: gdc-dev-ai-config
+            optional: true
+        - configMapRef:
+            name: gdc-dev-agent-config
+            optional: true
         resources:
           requests:
             cpu: 50m
@@ -500,10 +504,10 @@ metadata:
     app.kubernetes.io/name: gdc-dev
     {{- include "p13-gdc-dev.labels" . | nindent 4 }}
 data:
-  AUTH_MODE: oidc
-  ALLOW_SIMULATED_OIDC: "false"
-  HEADER_USER_KEY: X-Forwarded-User
-  OIDC_AUTHORITY: https://keycloak.gdc.local/realms/gdc-dev-realm
-  OIDC_CLIENT_ID: gdc-dev-client
-  OIDC_REDIRECT_URI: https://dev.gdc.local/auth/callback
+  AUTH_MODE: {{ (and .Values.auth .Values.auth.mode) | default "oidc" | quote }}
+  ALLOW_SIMULATED_OIDC: {{ (and .Values.auth .Values.auth.allowSimulatedOidc) | default "false" | quote }}
+  HEADER_USER_KEY: {{ (and .Values.auth .Values.auth.headerUserKey) | default "X-Forwarded-User" | quote }}
+  OIDC_AUTHORITY: {{ (and .Values.auth .Values.auth.oidcAuthority) | default "https://keycloak.gdc.local/realms/gdc-dev-realm" | quote }}
+  OIDC_CLIENT_ID: {{ (and .Values.auth .Values.auth.oidcClientId) | default "gdc-dev-client" | quote }}
+  OIDC_REDIRECT_URI: {{ (and .Values.auth .Values.auth.oidcRedirectUri) | default "https://dev.gdc.local/auth/callback" | quote }}
 {{- end }}

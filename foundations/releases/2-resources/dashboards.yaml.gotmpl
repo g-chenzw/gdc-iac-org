@@ -29,7 +29,10 @@ templates:
 releases:
 
   {{- range $tenantName, $tenantConfig := $envData.gdc_tenants }}
-    {{- range $project := $tenantConfig.global.projects }}
+    {{- $globalProjects := ($tenantConfig | get "global" dict) | get "projects" list }}
+    {{- $zonalProjects := $tenantConfig | get "projects" list }}
+    {{- $allProjects := concat $globalProjects $zonalProjects }}
+    {{- range $project := $allProjects }}
       {{- $dashboards := list }}
       {{- $hasExplicitDashboards := false }}
       
