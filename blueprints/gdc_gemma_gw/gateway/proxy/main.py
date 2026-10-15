@@ -2039,7 +2039,11 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                                     except Exception:
                                         pass
 
-                                    if "System role not supported" in error_msg or "maximum context length" in error_msg.lower():
+                                    if (
+                                        "System role not supported" in error_msg
+                                        or "maximum context length" in error_msg.lower()
+                                        or "tool" in error_msg.lower()
+                                    ):
                                         retry_payload = current_payload.copy()
                                         if "System role not supported" in error_msg:
                                             logger.warning(
@@ -2052,6 +2056,9 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                                             )
                                         if "maximum context length" in error_msg.lower():
                                             retry_payload["max_tokens"] = 512
+                                        if "tool" in error_msg.lower():
+                                            retry_payload.pop("tools", None)
+                                            retry_payload.pop("tool_choice", None)
 
                                         async with client.stream(
                                             "POST",
@@ -2202,7 +2209,11 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                     error_json = response.json()
                     logger.info(f"[Retry Engine] Downstream 400 raw body: {error_json}")
                     error_msg = error_json.get("error", {}).get("message", "") or str(error_json)
-                    if "System role not supported" in error_msg or "maximum context length" in error_msg.lower():
+                    if (
+                        "System role not supported" in error_msg
+                        or "maximum context length" in error_msg.lower()
+                        or "tool" in error_msg.lower()
+                    ):
                         retry_payload = payload.copy()
                         if "System role not supported" in error_msg:
                             logger.warning(
@@ -2215,6 +2226,12 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                             )
                         if "maximum context length" in error_msg.lower():
                             retry_payload["max_tokens"] = 256
+                        if "tool" in error_msg.lower():
+                            retry_payload.pop("tools", None)
+                            retry_payload.pop("tool_choice", None)
+                            retry_payload["messages"] = flatten_system_message(
+                                retry_payload["messages"]
+                            )
 
                         retry_response = await client.post(
                             target_url, json=retry_payload, headers=headers
