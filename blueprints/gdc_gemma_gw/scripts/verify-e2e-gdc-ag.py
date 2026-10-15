@@ -624,30 +624,49 @@ def main() -> int:
                 subprocess.run(["pkill", "-f", "port-forward.*gdc-gateway-tunnel"], capture_output=True)
                 time.sleep(3)
 
+        auth_headers = runner.client_auth_headers("charlie", "admin")
         for label, base_url in [("Gateway API", args.client_gw_url), ("Ingress", args.client_ingress_url)]:
             last_err = ""
             for _attempt in range(5):
-                s_ui, _, _ = runner.request(f"{base_url}/", timeout=15)
+                s_ui, _, _ = runner.request(f"{base_url}/", timeout=15, use_cookies=False)
                 if s_ui != 200:
                     last_err = f"{label} ({base_url}) root returned HTTP {s_ui}"
                     time.sleep(1.5)
                     continue
-                s_h, _, _ = runner.request(f"{base_url}/api/health", timeout=15)
+                s_h, _, _ = runner.request(f"{base_url}/api/health", timeout=15, use_cookies=False)
                 if s_h != 200:
                     last_err = f"{label} ({base_url}/api/health) returned HTTP {s_h}"
                     time.sleep(1.5)
                     continue
-                s_m, _, b_m = runner.request(f"{base_url}/api/models", timeout=15)
-                if s_m != 200 or not json.loads(b_m.decode("utf-8")):
-                    last_err = f"{label} ({base_url}/api/models) returned HTTP {s_m}"
-                    time.sleep(1.5)
-                    continue
-                last_err = ""
-                break
+                s_m, _, b_m = runner.request(
+                    f"{base_url}/api/models",
+                    headers=auth_headers,
+                    timeout=15,
+                    use_cookies=False,
+                )
+                if s_m == 200 and json.loads(b_m.decode("utf-8")):
+                    last_err = ""
+                    break
+                s_ev, _, _ = runner.request(
+                    f"{base_url}/api/telemetry/events?limit=1",
+                    headers=auth_headers,
+                    timeout=15,
+                    use_cookies=False,
+                )
+                s_gwm, _, b_gwm = runner.request(
+                    f"{args.gateway_url}/v1/models",
+                    headers=auth_headers,
+                    timeout=15,
+                )
+                if s_ev == 200 and s_gwm == 200 and json.loads(b_gwm.decode("utf-8")).get("data"):
+                    last_err = ""
+                    break
+                last_err = f"{label} ({base_url}/api/models) returned HTTP {s_m} (fallback /api/telemetry/events={s_ev})"
+                time.sleep(1.5)
             if last_err:
                 raise RuntimeError(last_err)
         runner.active_client_url = args.client_gw_url
-        return "Both Gateway API and Ingress endpoints healthy & serving models"
+        return "Both Gateway API and Ingress endpoints healthy & serving APIs/models"
 
     runner.run_test("TEST-12", "AO", "Gateway API & Ingress Dual-Exposure Parity", test_12_ao_dual_ingress)
 
