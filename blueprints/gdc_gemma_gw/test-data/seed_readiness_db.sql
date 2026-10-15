@@ -3,38 +3,6 @@
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- 0. Core Gemma Client Chat & File Tables (Idempotent)
-CREATE TABLE IF NOT EXISTS chats (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id VARCHAR(255) NOT NULL,
-    title TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    chat_id UUID REFERENCES chats(id) ON DELETE CASCADE,
-    role VARCHAR(50) NOT NULL,
-    content TEXT NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS files (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id VARCHAR(255),
-    filename VARCHAR(255) NOT NULL,
-    gcs_path TEXT NOT NULL,
-    file_size_bytes BIGINT,
-    content_type VARCHAR(100),
-    uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    is_shared BOOLEAN DEFAULT FALSE
-);
-
-CREATE INDEX IF NOT EXISTS idx_chats_user_id ON chats(user_id);
-CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);
-CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id);
-
 -- 1. Multi-Domain Sensor Telemetry (Kafka Ingestion Target)
 CREATE TABLE IF NOT EXISTS sensor_telemetry (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

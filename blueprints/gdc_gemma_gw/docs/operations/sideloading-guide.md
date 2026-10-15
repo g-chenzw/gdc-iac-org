@@ -1,3 +1,5 @@
+Copyright 2026 Google. This software is provided as-is, without warranty or representation for any use or purpose. Your use of it is subject to your agreement with Google.
+
 # Air-Gapped Packaging & Sideloading Guide
 
 > **Version:** 1.1
@@ -208,6 +210,30 @@ huggingface-cli download google/gemma-4-E4B-it --local-dir ./packages/gemma-4-E4
 tar -czf ./packages/gemma-4-26B-A4B-it-weights.tar.gz -C ./packages gemma-4-26B-A4B-it-weights
 tar -czf ./packages/gemma-4-31B-it-weights.tar.gz -C ./packages gemma-4-31B-it-weights
 tar -czf ./packages/gemma-4-E4B-it-weights.tar.gz -C ./packages gemma-4-E4B-it-weights
+```
+
+### 2.6. Staging & Replicating Production Assets to `GDC-blueprints` and `gdc-iac-org`
+
+Whenever you update Gateway/Client source code, Helm charts (`blueprints/*`, `standalone/chart`, `gemma-client/chart`), or documentation in `gdc_gemma_gw`, run the 3-step production staging pipeline to update `deploy-to-production/` and replicate strictly GDC-ag production-ready assets into `GDC-blueprints` and `gdc-iac-org`:
+
+> [!IMPORTANT]
+> **Automatic Stripping of GCP-Only Assets (`GCP_ONLY_IGNORED`):**
+> `scripts/stage_production_assets.py` automatically strips all GCP/GKE staging-only manifests, scripts, and tutorials (`gemma-client/manifests/gcp/`, `scripts/verify-e2e-gcp-staging.py`, `scripts/cleanup-e2e-gcp.sh`, `docs/tutorials/ai_enabled_e2e_gcp_staging_guide.md`, `docs/tutorials/quickstart_on_GCP.md`, and `docs/testing/gcp-sandbox-keycloak-testing-strategy.md`) so `deploy-to-production/` and `gdc-iac-org` remain 100% GDC-ag production-only.
+
+```bash
+# Step 1: Stage production-only assets in gdc_gemma_gw/deploy-to-production/
+# (Use ~/GitHub/... on a Cloud Workstation or ~/src/... on Cloudtop)
+cd ~/GitHub/gdc_gemma_gw
+python3 scripts/stage_production_assets.py all --skip-images
+
+# Step 2: Stage all patterns + sync external gdc_gemma_gw into GDC-blueprints/deploy-to-production/
+cd ~/GitHub/GDC-blueprints
+python3 scripts/stage_production_assets.py all --skip-images --sync-external-gemma-gw
+
+# Step 3: Replicate strictly production-only assets into gdc-iac-org/blueprints/
+rsync -av --delete --exclude='README.md' \
+  ~/GitHub/GDC-blueprints/deploy-to-production/ \
+  ~/GitHub/gdc-iac-org/blueprints/
 ```
 
 ---

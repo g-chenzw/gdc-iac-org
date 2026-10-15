@@ -1,3 +1,5 @@
+Copyright 2026 Google. This software is provided as-is, without warranty or representation for any use or purpose. Your use of it is subject to your agreement with Google.
+
 # Envoy `InferencePool` + `epp` Endpoint Picker Blueprint (`blueprints/envoy-inference-pool`)
 
 This optional Helm chart packages the Kubernetes **Gateway API Inference Extension (`InferencePool` + `epp` Endpoint Picker)** and **Envoy AI Gateway (`AIGatewayRoute` + `BackendTrafficPolicy`)** as an intelligent L7 backend load balancer and per-user token rate limiter behind `gdc_gemma_gw` (`gemma-gateway`).

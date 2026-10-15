@@ -44,6 +44,12 @@ fi
 
 # 3. Seed Operational Readiness Database
 echo "[2/6] Seeding operational readiness schema and intelligence data into PostgreSQL..."
+for i in {1..15}; do
+  if kubectl exec postgres-0 -n "${NAMESPACE}" -- pg_isready -U postgres >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
 kubectl exec -i postgres-0 -n "${NAMESPACE}" -- psql -U postgres -d postgres < test-data/seed_readiness_db.sql
 echo "[+] Operational database seeded successfully (Units, Equipment, Fuel, Routes, Telemetry, Cables)."
 
@@ -78,8 +84,41 @@ if kubectl get deployment keycloak -n "${NAMESPACE}" >/dev/null 2>&1; then
   kubectl rollout status deployment/keycloak -n "${NAMESPACE}" --timeout=90s || true
 fi
 
-# Ensure required ServiceAccount and PostgreSQL credentials secret exist before deploying backend
-kubectl create serviceaccount gemma-client-sa -n "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+# Ensure GCS Object Storage bucket exists and bind Workload Identity for gemma-client-sa
+export BUCKET_NAME="gs://gemma-client-files-${PROJECT_ID}"
+export GSA_NAME="gemma-client-sa"
+export KSA_NAME="gemma-client-sa"
+
+if ! gcloud storage buckets describe "${BUCKET_NAME}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  echo "[+] Creating GCS Object Storage bucket ${BUCKET_NAME} in ${REGION}..."
+  gcloud storage buckets create "${BUCKET_NAME}" --project="${PROJECT_ID}" --location="${REGION}" --uniform-bucket-level-access || true
+else
+  echo "[+] GCS Object Storage bucket ${BUCKET_NAME} verified."
+fi
+
+if ! gcloud iam service-accounts describe "${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "${GSA_NAME}" --project="${PROJECT_ID}" || true
+fi
+
+gcloud storage buckets add-iam-policy-binding "${BUCKET_NAME}" \
+  --member="serviceAccount:${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin" --quiet >/dev/null 2>&1 || true
+
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin" \
+  --condition=None --quiet >/dev/null 2>&1 || true
+
+gcloud iam service-accounts add-iam-policy-binding "${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --project="${PROJECT_ID}" \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/${KSA_NAME}]" --quiet >/dev/null 2>&1 || true
+
+# Ensure required ServiceAccount (with Workload Identity annotation) and PostgreSQL credentials secret exist
+kubectl create serviceaccount "${KSA_NAME}" -n "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+kubectl annotate serviceaccount "${KSA_NAME}" -n "${NAMESPACE}" \
+  "iam.gke.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" --overwrite
+
 kubectl create secret generic gemma-client-db-credentials \
   --from-literal=username=postgres \
   --from-literal=password=password \
@@ -95,10 +134,15 @@ sed -i "s|INPUT_BUCKET_PLACEHOLDER|gemma-client-files-${PROJECT_ID}|g" gemma-cli
 
 kubectl apply -f gemma-client/manifests/apps/backend.yaml -n "${NAMESPACE}"
 kubectl set env deployment/backend \
+  PROJECT_ID="${PROJECT_ID}" \
+  INPUT_BUCKET="${BUCKET_NAME}" \
   ENABLE_OIDC="true" \
   KEYCLOAK_URL="http://keycloak-svc:8080/auth/realms/gdc-rag-realm" \
   -n "${NAMESPACE}"
 
+if [ "$(kubectl get svc frontend-svc -n "${NAMESPACE}" -o jsonpath='{.spec.type}' 2>/dev/null || true)" = "LoadBalancer" ]; then
+  kubectl delete svc frontend-svc -n "${NAMESPACE}" --ignore-not-found
+fi
 kubectl apply -f gemma-client/manifests/apps/frontend.yaml -n "${NAMESPACE}"
 
 echo "[+] Waiting for frontend and backend rollouts..."

@@ -1,3 +1,5 @@
+Copyright 2026 Google. This software is provided as-is, without warranty or representation for any use or purpose. Your use of it is subject to your agreement with Google.
+
 # Gemma 4 Dedicated Inference Gateway — Documentation Hub
 
 All documentation for the **Gemma 4 Dedicated Inference Gateway (`gdc_gemma_gw`)**, **Gemma Client & Joint Intelligence Console (`gemma-client`)**, and **Envoy `InferencePool` (`blueprints/envoy-inference-pool`)** is consolidated in this `docs/` directory and organized into four subfolders by purpose.

@@ -1,3 +1,5 @@
+Copyright 2026 Google. This software is provided as-is, without warranty or representation for any use or purpose. Your use of it is subject to your agreement with Google.
+
 # Zero-Tweak E2E Validation Runbook & IO/AO Upgrade Verification Suite
 
 > **Document ID:** `RUNBOOK-E2E-ZERO-TWEAK-AND-UPGRADE-SUITE`  

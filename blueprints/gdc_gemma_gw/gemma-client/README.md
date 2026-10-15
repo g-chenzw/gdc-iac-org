@@ -1,3 +1,5 @@
+Copyright 2026 Google. This software is provided as-is, without warranty or representation for any use or purpose. Your use of it is subject to your agreement with Google.
+
 # Gemma Client - Multi-User Chat Interface
 
 **Use Case:** A multi-user chatbot interface for **Gemma 4** models in a GDC air-gapped environment. This pattern provides a direct wrapper around the **Gemma Inference Gateway**, allowing users to chat, upload documents, and ground reasoning tasks securely. It supports model selection, chat history persistence, and role-based access control (RBAC).

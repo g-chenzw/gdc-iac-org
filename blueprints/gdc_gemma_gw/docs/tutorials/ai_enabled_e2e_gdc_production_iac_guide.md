@@ -1,3 +1,5 @@
+Copyright 2026 Google. This software is provided as-is, without warranty or representation for any use or purpose. Your use of it is subject to your agreement with Google.
+
 # AI-Enabled Blueprint End-to-End Deployment & Verification Guide (GDC-ag Production IaC)
 
 > **Document ID:** `GUIDE-GDC-AI-BLUEPRINT-E2E-IAC`  
