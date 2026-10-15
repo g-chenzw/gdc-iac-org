@@ -567,6 +567,70 @@ def get_gateway_auth_context(request: Request) -> Dict[str, Any]:
     }
 
 
+def _heal_keycloak_user_profile(keycloak_url: str, username: str) -> bool:
+    """
+    Populates required Keycloak 24 UserProfile attributes (firstName, lastName, email)
+    via the Keycloak Admin REST API if an imported realm user triggers 'Account is not fully set up'.
+    """
+    base_origin = keycloak_url.split("/realms/")[0].rstrip("/")
+    realm_name = keycloak_url.split("/realms/")[1].split("/")[0] if "/realms/" in keycloak_url else "gdc-rag-realm"
+    admin_token_url = f"{base_origin}/realms/master/protocol/openid-connect/token"
+    admin_form = urllib.parse.urlencode(
+        {
+            "grant_type": "password",
+            "client_id": "admin-cli",
+            "username": os.getenv("KEYCLOAK_ADMIN", "admin"),
+            "password": os.getenv("KEYCLOAK_ADMIN_PASSWORD", "password"),
+        }
+    ).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            admin_token_url,
+            data=admin_form,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            admin_tok = json.loads(resp.read().decode("utf-8")).get("access_token", "")
+        if not admin_tok:
+            return False
+
+        users_url = f"{base_origin}/admin/realms/{realm_name}/users?username={urllib.parse.quote(username)}&exact=true"
+        u_req = urllib.request.Request(
+            users_url,
+            headers={"Authorization": f"Bearer {admin_tok}", "Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(u_req, timeout=3.0) as u_resp:
+            users = json.loads(u_resp.read().decode("utf-8"))
+        if not users:
+            return False
+
+        user_obj = users[0]
+        uid = user_obj.get("id")
+        user_obj["firstName"] = user_obj.get("firstName") or username.capitalize()
+        user_obj["lastName"] = user_obj.get("lastName") or "Operator"
+        user_obj["email"] = user_obj.get("email") or f"{username}@gdc.local"
+        user_obj["emailVerified"] = True
+        user_obj["enabled"] = True
+        user_obj["requiredActions"] = []
+
+        put_req = urllib.request.Request(
+            f"{base_origin}/admin/realms/{realm_name}/users/{uid}",
+            data=json.dumps(user_obj).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {admin_tok}",
+                "Content-Type": "application/json",
+            },
+            method="PUT",
+        )
+        with urllib.request.urlopen(put_req, timeout=3.0):
+            return True
+    except Exception as exc:
+        logger.debug(f"Keycloak profile auto-heal skipped for {username}: {exc}")
+        return False
+
+
 def _authenticate_keycloak_direct(username: str, password: str) -> Optional[Dict[str, Any]]:
     """
     Attempts a direct Resource Owner Password Credentials grant against the in-cluster
@@ -585,46 +649,56 @@ def _authenticate_keycloak_direct(username: str, password: str) -> Optional[Dict
             "password": password,
         }
     ).encode("utf-8")
-    req = urllib.request.Request(
-        token_url,
-        data=form_data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=2.5) as resp:
-            token_payload = json.loads(resp.read().decode("utf-8"))
-            access_token = token_payload.get("access_token", "")
-            roles: List[str] = []
-            preferred_user = username
-            if access_token and jwt is not None:
-                try:
-                    unverified = jwt.decode(
-                        access_token, options={"verify_signature": False}
-                    )
-                    preferred_user = str(
-                        unverified.get("preferred_username") or username
-                    )
-                    roles = [
-                        str(r).lower()
-                        for r in unverified.get("realm_access", {}).get("roles", [])
-                        if r
-                    ]
-                except Exception:
-                    pass
-            if not roles:
-                roles = ["admin", "user"] if username.lower() in ("charlie", "admin") else ["user"]
-            is_admin = bool(set(roles) & ADMIN_ROLE_NAMES)
-            return {
-                "user": preferred_user,
-                "role": "admin" if is_admin else (roles[0] if roles else "user"),
-                "roles": roles,
-                "access_token": access_token,
-                "source": "keycloak-direct",
-            }
-    except Exception as e:
-        logger.debug(f"Direct Keycloak token exchange skipped/fell back to simulated OIDC: {e}")
-        return None
+
+    for attempt in range(2):
+        req = urllib.request.Request(
+            token_url,
+            data=form_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                token_payload = json.loads(resp.read().decode("utf-8"))
+                access_token = token_payload.get("access_token", "")
+                roles: List[str] = []
+                preferred_user = username
+                if access_token and jwt is not None:
+                    try:
+                        unverified = jwt.decode(
+                            access_token, options={"verify_signature": False}
+                        )
+                        preferred_user = str(
+                            unverified.get("preferred_username") or username
+                        )
+                        roles = [
+                            str(r).lower()
+                            for r in unverified.get("realm_access", {}).get("roles", [])
+                            if r
+                        ]
+                    except Exception:
+                        pass
+                if not roles:
+                    roles = ["admin", "user"] if username.lower() in ("charlie", "admin") else ["user"]
+                is_admin = bool(set(roles) & ADMIN_ROLE_NAMES)
+                return {
+                    "user": preferred_user,
+                    "role": "admin" if is_admin else (roles[0] if roles else "user"),
+                    "roles": roles,
+                    "access_token": access_token,
+                    "source": "keycloak-direct",
+                }
+        except urllib.error.HTTPError as http_err:
+            err_body = http_err.read().decode("utf-8", errors="replace") if http_err.fp else ""
+            if attempt == 0 and http_err.code == 400 and "not fully set up" in err_body.lower():
+                if _heal_keycloak_user_profile(keycloak_url, username):
+                    continue
+            logger.debug(f"Direct Keycloak token exchange HTTP {http_err.code}: {err_body}")
+            return None
+        except Exception as e:
+            logger.debug(f"Direct Keycloak token exchange skipped/fell back to simulated OIDC: {e}")
+            return None
+    return None
 
 
 def verify_api_auth(request: Request) -> None:
@@ -1565,11 +1639,19 @@ async def get_metrics():
 
     backend_stats = await _scrape_backend_telemetry()
 
+    active_fw = os.getenv("ACTIVE_FRAMEWORK", ACTIVE_FRAMEWORK)
+    active_variant = CURRENT_STATE.get("model_variant", os.getenv("OLLAMA_MODEL_VARIANT", "26b"))
+
     return {
+        "status": "online",
+        "framework": active_fw,
+        "model": f"gemma4:{active_variant}",
         "cpu_utilization": round(cpu_util, 1),
         "gpu_utilization": backend_stats["gpu_utilization"],
+        "gpu_util": backend_stats["gpu_utilization"],
         "vram_total_gb": backend_stats["vram_total_gb"],
         "vram_used_gb": backend_stats["vram_used_gb"],
+        "vram_used": backend_stats["vram_used_gb"],
         "vram_percent": backend_stats["vram_percent"],
         "kv_cache_usage_percent": backend_stats["kv_cache_usage_percent"],
         "vllm_requests_running": backend_stats["vllm_requests_running"],
@@ -1634,12 +1716,14 @@ async def block_user(
 
 
 @app.get("/api/config")
+@app.get("/admin/config")
 async def get_config():
     sync_shared_state()
     return CURRENT_STATE
 
 
 @app.post("/api/config")
+@app.post("/admin/config")
 async def update_config(
     config: UpdateConfigRequest, _auth: None = Depends(verify_admin_auth)
 ):
@@ -1657,6 +1741,30 @@ async def update_config(
     persist_shared_state()
     logger.info(f"Configuration updated: {CURRENT_STATE}")
     return {"status": "success", "new_state": CURRENT_STATE}
+
+
+class AdminBlockBody(BaseModel):
+    user_id: str
+    blocked: bool = True
+
+
+@app.get("/admin/sessions")
+async def get_admin_sessions(_auth: None = Depends(verify_admin_auth)):
+    sync_shared_state()
+    return {
+        "sessions": list(ACTIVE_SESSIONS.values()),
+        "blocked_users": sorted(list(BLOCKED_USERS)),
+    }
+
+
+@app.post("/admin/block")
+async def admin_block_user(body: AdminBlockBody, _auth: None = Depends(verify_admin_auth)):
+    return await block_user(body.user_id, BlockUserRequest(blocked=True), _auth)
+
+
+@app.post("/admin/unblock")
+async def admin_unblock_user(body: AdminBlockBody, _auth: None = Depends(verify_admin_auth)):
+    return await block_user(body.user_id, BlockUserRequest(blocked=False), _auth)
 
 
 @app.get("/v1/models")

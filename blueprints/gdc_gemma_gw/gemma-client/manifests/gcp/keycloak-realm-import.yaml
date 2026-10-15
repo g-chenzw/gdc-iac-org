@@ -54,6 +54,11 @@ data:
         {
           "username": "alice",
           "enabled": true,
+          "firstName": "Alice",
+          "lastName": "Analyst",
+          "email": "alice@gdc.local",
+          "emailVerified": true,
+          "requiredActions": [],
           "realmRoles": [
             "user"
           ],
@@ -68,6 +73,11 @@ data:
         {
           "username": "charlie",
           "enabled": true,
+          "firstName": "Charlie",
+          "lastName": "Commander",
+          "email": "charlie@gdc.local",
+          "emailVerified": true,
+          "requiredActions": [],
           "realmRoles": [
             "admin"
           ],
