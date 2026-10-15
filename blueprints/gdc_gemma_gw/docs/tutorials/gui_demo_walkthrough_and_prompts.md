@@ -78,7 +78,7 @@ EOF
 3. **Expected Result:**
    - On Port `8080`, a green confirmation toast appears (`Gateway configuration updated successfully`).
    - On Port `8081`, even though the prompt is simple conversational text, the navbar routing badge displays **`→ gemma4:31b`** and generation uses `temperature=0.2`.
-   - Return to **Port `8080`**, restore **`Model Variant Hot-Swap`** to **`Gemma 4 26B A4B (MoE) — Fast Tier 1`** and **`Sampling Temperature`** to `0.7`, and click **`Save Gateway Configuration`**.
+   - Return to **Port `8080`** and click **`↺ Reset to Auto`** to restore **`Gemma 4 Gateway (Auto: 26B MoE → 31B Dense)`**, **`Sampling Temperature`** `0.7`, **`Top-P`** `0.9`, and **`Max Vision Tokens`** `280`.
 
 ---
 

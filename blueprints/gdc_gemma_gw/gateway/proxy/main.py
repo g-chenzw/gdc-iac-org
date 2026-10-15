@@ -1553,7 +1553,8 @@ async def get_metrics():
     backend_stats = await _scrape_backend_telemetry()
 
     active_fw = os.getenv("ACTIVE_FRAMEWORK", ACTIVE_FRAMEWORK)
-    active_variant = CURRENT_STATE.get("model_variant", os.getenv("OLLAMA_MODEL_VARIANT", "26b"))
+    raw_variant = CURRENT_STATE.get("model_variant", os.getenv("OLLAMA_MODEL_VARIANT", "26b"))
+    active_variant = "26b" if raw_variant == "auto" else raw_variant
 
     return {
         "status": "online",
@@ -1687,7 +1688,8 @@ async def list_models():
     """OpenAI-compatible models discovery endpoint."""
     sync_shared_state()
     if ACTIVE_FRAMEWORK == "ollama":
-        model_variant = CURRENT_STATE.get("model_variant", "26b")
+        raw_variant = CURRENT_STATE.get("model_variant", "26b")
+        model_variant = "26b" if raw_variant == "auto" else raw_variant
         return {
             "object": "list",
             "data": [
@@ -1787,12 +1789,14 @@ def classify_prompt_complexity(
             )
             return "gemma4:31b"
         if explicit_tier in ("low", "simple", "moe", "26b"):
-            fallback_variant = CURRENT_STATE.get("model_variant", "26b")
+            raw_variant = CURRENT_STATE.get("model_variant", "26b")
+            fallback_variant = "26b" if raw_variant == "auto" else raw_variant
             return f"gemma4:{fallback_variant}"
 
     messages = payload.get("messages", [])
     if not messages:
-        fallback_variant = CURRENT_STATE.get("model_variant", "26b")
+        raw_variant = CURRENT_STATE.get("model_variant", "26b")
+        fallback_variant = "26b" if raw_variant == "auto" else raw_variant
         return f"gemma4:{fallback_variant}"
 
     # Evaluate only the latest user prompt content (the last user message in the array)
@@ -1830,7 +1834,8 @@ def classify_prompt_complexity(
         )
         return "gemma4:31b"
 
-    fallback_variant = CURRENT_STATE.get("model_variant", "26b")
+    raw_variant = CURRENT_STATE.get("model_variant", "26b")
+    fallback_variant = "26b" if raw_variant == "auto" else raw_variant
     logger.info(
         f"[Classifier] General conversational query detected. Routing to dynamic override: gemma4:{fallback_variant}"
     )
