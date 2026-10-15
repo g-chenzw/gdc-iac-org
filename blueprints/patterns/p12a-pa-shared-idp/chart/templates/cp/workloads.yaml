@@ -1,0 +1,552 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+{{- if and .Values.controlPlane.enabled .Values.apps.enabled }}
+{{- $ns := include "p12a-pa-shared-idp.namespace" . }}
+{{- $reg := include "p12a-pa-shared-idp.registry" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keycloak-cp
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+automountServiceAccountToken: true
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: bundledidp-keycloak-https-ca
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  isCA: true
+  commonName: {{ printf "bundledidp-keycloak-https-ca.%s.svc.cluster.local" $ns }}
+  secretName: bundledidp-keycloak-https-ca
+  duration: 87600h
+  renewBefore: 8760h
+  issuerRef:
+    name: internal-root-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: keycloak-cp-ca-issuer
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  ca:
+    secretName: bundledidp-keycloak-https-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: keycloak-cp-keycloak-https
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  secretName: keycloak-cp-keycloak-https
+  duration: 8760h
+  renewBefore: 720h
+  subject:
+    organizations:
+      - gdch
+  commonName: {{ .Values.fqdnPrefix }}
+  isCA: false
+  privateKey:
+    algorithm: RSA
+    encoding: PKCS1
+    size: 4096
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    - {{ printf "%s.%s" .Values.fqdnPrefix .Values.dnsSuffix }}
+    - {{ printf "%s.%s" .Values.fqdnPrefix .Values.globalDnsSuffix }}
+    - {{ printf "keycloak-cp-headless.%s.svc.cluster.local" $ns }}
+  issuerRef:
+    name: keycloak-cp-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+  keystores:
+    pkcs12:
+      create: true
+      passwordSecretRef:
+        name: {{ .Values.secretNames.keystorePassword }}
+        key: password
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-cp-headless
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+    app.kubernetes.io/component: headless
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-cp-http
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+    app.kubernetes.io/component: http
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak-cp
+  namespace: {{ $ns }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+  labels:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak-cp
+      app.kubernetes.io/instance: keycloak-cp
+  replicas: 1
+  serviceName: keycloak-cp-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keycloak-cp
+        app.kubernetes.io/instance: keycloak-cp
+        monitoring.gdc.goog/inject-proxy: keycloak-bundledidp-backend
+    spec:
+      serviceAccountName: keycloak-cp
+      securityContext:
+        fsGroup: 1000
+      enableServiceLinks: true
+      restartPolicy: Always
+      tolerations:
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node.kubernetes.io/disk-pressure"
+          operator: "Exists"
+          effect: "NoSchedule"
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        - name: dbchecker
+          image: {{ printf "%s/bundledidp-pgchecker:%s" $reg .Values.controlPlane.pgcheckerTag | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+          command:
+            - sh
+            - -c
+            - |
+              echo 'Waiting for Database pg-keycloak-db-ilb:5432 to become ready...'
+              until printf "." && nc -z -w 2 pg-keycloak-db-ilb 5432; do
+                sleep 2
+              done
+              echo 'Database OK ✓'
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "32Mi"
+            limits:
+              cpu: "20m"
+              memory: "32Mi"
+      containers:
+        - name: keycloak
+          image: {{ printf "%s/keycloak:%s" $reg .Values.controlPlane.keycloakTag | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            seLinuxOptions:
+              type: "spc_t"
+          args:
+            - {{ printf "-Djgroups.dns.query=keycloak-cp-headless.%s.svc.cluster.local" $ns | quote }}
+            - "--spi-events-listener-jboss-logging-success-level=info"
+            - "--spi-events-listener-jboss-logging-error-level=warn"
+            - '-Dquarkus.log.handler.file."EVENTS_LOGGING_FILE".enable=true'
+            - '-Dquarkus.log.handler.file."EVENTS_LOGGING_FILE".path=/var/log/events.log'
+            - '-Dquarkus.log.category."org.keycloak.events".level=INFO'
+            - '-Dquarkus.log.category."org.keycloak.events".handlers=EVENTS_LOGGING_FILE'
+            - "-Djava.security.properties=/opt/keycloak/conf/security/kc.java.security"
+            - "--log-level=INFO,org.keycloak.common.crypto:TRACE,org.keycloak.crypto:TRACE"
+          env:
+            - name: KC_HTTP_RELATIVE_PATH
+              value: "/keycloak"
+            - name: KC_CACHE
+              value: "ispn"
+            - name: KC_CACHE_STACK
+              value: "kubernetes"
+            - name: KC_PROXY_HEADERS
+              value: "forwarded"
+            - name: KC_DB
+              value: "postgres"
+            - name: KC_DB_URL_HOST
+              value: "pg-keycloak-db-ilb"
+            - name: KC_DB_URL_PORT
+              value: "5432"
+            - name: KC_DB_URL_DATABASE
+              value: "postgres"
+            - name: KC_DB_USERNAME
+              value: "dbsadmin"
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretNames.cpDbPassword }}
+                  key: password
+            - name: KC_METRICS_ENABLED
+              value: "true"
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_FEATURES
+              value: "fips"
+            - name: KC_LOG_LEVEL
+              value: "INFO,org.keycloak.common.crypto:TRACE,org.keycloak.crypto:TRACE"
+            - name: KEYCLOAK_ADMIN
+              value: "admin"
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretNames.adminPassword }}
+                  key: secret
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            - name: KC_HOSTNAME_STRICT_HTTPS
+              value: "false"
+            - name: KC_HTTPS_CLIENT_AUTH
+              value: "request"
+            - name: KC_HTTPS_KEY_STORE_FILE
+              value: "/opt/keycloak/secrets/keystore.p12"
+            - name: KC_HTTPS_KEY_STORE_TYPE
+              value: "pkcs12"
+            - name: KC_HTTPS_KEY_STORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretNames.keystorePassword }}
+                  key: password
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: http-internal
+              containerPort: 9000
+              protocol: TCP
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: "/keycloak/health/live"
+              port: http-internal
+              scheme: HTTPS
+            initialDelaySeconds: 0
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: "/keycloak/health/ready"
+              port: http-internal
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+          startupProbe:
+            httpGet:
+              path: "/keycloak/health"
+              port: http-internal
+              scheme: HTTPS
+            initialDelaySeconds: 15
+            timeoutSeconds: 1
+            failureThreshold: 60
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: "1Gi"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+            - name: tls-config-volume
+              mountPath: /opt/keycloak/secrets
+              readOnly: true
+      volumes:
+        - name: varlog
+          emptyDir: {}
+        - name: tls-config-volume
+          secret:
+            secretName: keycloak-cp-keycloak-https
+            items:
+              - key: keystore.p12
+                path: keystore.p12
+              - key: ca.crt
+                path: ca.crt
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: keycloak-cp-headless-destination-rule
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  host: {{ printf "keycloak-cp-headless.%s.svc.cluster.local" $ns }}
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+      credentialName: trust-store-internal-only
+      sni: {{ printf "%s.%s" .Values.fqdnPrefix .Values.dnsSuffix }}
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: keycloak-cp-gateway
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  selector:
+    istio: infra-ingress-gateway
+  servers:
+    - port:
+        number: 443
+        name: https-443
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: {{ .Values.fqdnPrefix }}-mp-web-tls
+      hosts:
+        - {{ printf "%s.%s" .Values.fqdnPrefix .Values.dnsSuffix }}
+        - {{ printf "%s.%s" .Values.fqdnPrefix .Values.globalDnsSuffix }}
+    - port:
+        number: 8443
+        name: https-8443
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: {{ .Values.fqdnPrefix }}-mp-web-tls
+      hosts:
+        - {{ printf "%s.%s" .Values.fqdnPrefix .Values.dnsSuffix }}
+        - {{ printf "%s.%s" .Values.fqdnPrefix .Values.globalDnsSuffix }}
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: keycloak-cp-customer-gateway
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  selector:
+    istio: dataplane-ingress-gateway
+  servers:
+    - port:
+        number: 443
+        name: https-443
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: {{ .Values.fqdnPrefix }}-mp-web-tls
+      hosts:
+        - {{ printf "%s.%s" .Values.fqdnPrefix .Values.dnsSuffix }}
+        - {{ printf "%s.%s" .Values.fqdnPrefix .Values.globalDnsSuffix }}
+    - port:
+        number: 8443
+        name: https-8443
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: {{ .Values.fqdnPrefix }}-mp-web-tls
+      hosts:
+        - {{ printf "%s.%s" .Values.fqdnPrefix .Values.dnsSuffix }}
+        - {{ printf "%s.%s" .Values.fqdnPrefix .Values.globalDnsSuffix }}
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: keycloak-cp-virtualservice
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  hosts:
+    - {{ printf "%s.%s" .Values.fqdnPrefix .Values.dnsSuffix }}
+    - {{ printf "%s.%s" .Values.fqdnPrefix .Values.globalDnsSuffix }}
+  gateways:
+    - keycloak-cp-gateway
+    - keycloak-cp-customer-gateway
+  http:
+    - name: open-paths
+      route:
+        - destination:
+            host: keycloak-cp-headless
+            port:
+              number: 8443
+{{- if .Values.controlPlane.realmSetup.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: keycloak-pa-demo-setup
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keycloak-pa-demo-setup
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: keycloak-cp
+      securityContext:
+        runAsUser: 1000
+        runAsNonRoot: true
+      containers:
+        - name: seed-realm-and-users
+          image: {{ printf "%s/keycloak:%s" $reg .Values.controlPlane.keycloakTag | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              export KC_SERVER="https://keycloak-cp-headless.{{ $ns }}.svc.cluster.local:8443/keycloak"
+              export KCADM="/opt/keycloak/bin/kcadm.sh"
+              export TRUSTSTORE="/tmp/kcadm-truststore.p12"
+              export CONFIG_FILE="/tmp/kcadm.config"
+              export REALM="{{ .Values.controlPlane.realmSetup.realm }}"
+              export TRUSTPASS="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+              trap 'rm -f "${TRUSTSTORE}" "${CONFIG_FILE}"' EXIT
+
+              keytool -importcert -noprompt \
+                -alias keycloak-internal-ca \
+                -file /opt/keycloak/secrets/ca.crt \
+                -keystore "${TRUSTSTORE}" \
+                -storetype PKCS12 \
+                -storepass "${TRUSTPASS}"
+
+              until "${KCADM}" config credentials \
+                --server "${KC_SERVER}" \
+                --realm master \
+                --user admin \
+                --password "${KEYCLOAK_ADMIN_PASSWORD}" \
+                --truststore "${TRUSTSTORE}" \
+                --trustpass "${TRUSTPASS}" \
+                --config "${CONFIG_FILE}"; do
+                sleep 5
+              done
+
+              "${KCADM}" get "realms/${REALM}" --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}" >/dev/null 2>&1 || \
+                "${KCADM}" create realms \
+                  -s "realm=${REALM}" \
+                  -s "id=${REALM}" \
+                  -s "enabled=true" \
+                  -s "displayName=GDC Air-Gapped PA Shared IdP" \
+                  -s "sslRequired=external" \
+                  --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}"
+          env:
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretNames.adminPassword }}
+                  key: secret
+            - name: DEMO_USER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretNames.demoUserPassword }}
+                  key: secret
+          volumeMounts:
+            - name: tls-ca-volume
+              mountPath: /opt/keycloak/secrets/ca.crt
+              subPath: ca.crt
+              readOnly: true
+      volumes:
+        - name: tls-ca-volume
+          secret:
+            secretName: keycloak-cp-keycloak-https
+            items:
+              - key: ca.crt
+                path: ca.crt
+{{- end }}
+{{- end }}

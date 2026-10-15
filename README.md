@@ -119,6 +119,7 @@ The `blueprints/` directory contains **100% self-contained**, production-ready d
   - `p10-gemini-gui`: Conversational web interface for internal AI models
   - `p11-vault`: Enterprise secret management with HashiCorp Vault
   - `p12-keycloak`: Centralized Identity and Access Management with Keycloak
+  - `p12a-pa-shared-idp`: Multi-cluster shared Keycloak Identity Provider with SAML 2.0 federation for Platform Administrators
   - `p13-gdc-dev`: Developer workstation and sandbox environment
 - **Gemma LLM Gateway (`blueprints/gdc_gemma_gw/`)**: Production inference serving for Google Gemma models.
 - **Air-Gapped Tooling (`blueprints/common-scripts/`)**: Scripts for offline image mirroring (`bulk_mirror_images.sh`), parameter substitution (`configure-blueprints.sh`), and packaging (`package-for-gdc.sh`).

@@ -1,0 +1,81 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Global context parameters injected by the GDC IaC framework (Helmfile / ArgoCD)
+global:
+  projectId: "pa-demo-keycloak"
+  namespace: "pa-demo-keycloak"
+  registry: "harbor.gdc.local/gpc-system"
+  imagePullSecrets: []
+  commonLabels: {}
+  commonAnnotations: {}
+
+# Fallback top-level namespace/registry for direct helm install
+namespace: ""
+registry: ""
+
+# Shared DNS & Identity parameters (auto-discovered via scripts/deploy.sh)
+fqdnPrefix: "pa-demo-keycloak"
+dnsSuffix: "gdchservices.zone1.gdc.example.com"
+globalDnsSuffix: "gdchservices.gdc.example.com"
+
+# Compatibility aliases with gdc-iac-org 5-workload-factory conventions
+gdc:
+  enabled: false
+  failover:
+    enabled: false
+apps:
+  enabled: true
+
+# Names of pre-created Kubernetes Secrets on infra-mp and infra-cp.
+# Never store raw or base64 credentials in values.yaml; create Secrets at
+# runtime via scripts/deploy.sh or kubectl create secret generic.
+secretNames:
+  mpDbPassword: "db-pw-keycloak-db"
+  cpDbPassword: "bundledidp-keycloak-database-pw"
+  keystorePassword: "keycloak-cp-keystore-password"
+  adminPassword: "bundledidp-local-admin-password"
+  demoUserPassword: "bundledidp-initial-user-password"
+
+# Stage 1: Organization Management Plane (infra-mp) resources
+# Provisions DBCluster/keycloak-db, Web TLS Certificate (with forward-to-cp), and 4x DNSRegistrations
+managementPlane:
+  enabled: false
+  db:
+    version: "14"
+    cpu: "500m"
+    memory: "1024Mi"
+    diskSize: "5Gi"
+
+# Stage 2: Organization Control Plane (infra-cp) resources
+# Provisions internal PKCS12 Certificate (<=64-byte CN), StatefulSet/keycloak-cp,
+# Istio Gateways (443/8443), DestinationRule, VirtualService (open-paths), and Realm Setup Job
+controlPlane:
+  enabled: true
+  keycloakTag: "v24.0.4"
+  pgcheckerTag: "v1.0.0"
+  realmSetup:
+    enabled: true
+    realm: "pa-demo"
+
+# Stage 3: Target Tenant Organization Global API Server resources
+# Connects the target organization to the PA Shared Keycloak IdP via SAML 2.0.
+# Supply idpCertificateDataBase64Pem at deploy time from the realm SAML descriptor.
+tenantFederation:
+  enabled: false
+  idpCertificateDataBase64Pem: ""
+  groupPrefix: "pa-kc-"
+  userPrefix: "pa-kc-"
+  adminGroup: "pa-admins"
+  roleName: "organization-iam-admin"

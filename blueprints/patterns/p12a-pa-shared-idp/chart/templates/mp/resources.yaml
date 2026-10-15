@@ -1,0 +1,140 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+{{- if or .Values.managementPlane.enabled .Values.gdc.enabled }}
+{{- $ns := include "p12a-pa-shared-idp.namespace" . }}
+apiVersion: postgresql.dbadmin.gdc.goog/v1
+kind: DBCluster
+metadata:
+  name: keycloak-db
+  namespace: {{ $ns }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+    fleet.dbadmin.goog/retain-admin-password-secret: "true"
+    helm.sh/resource-policy: keep
+  labels:
+    fleet.dbadmin.goog/platform: rac
+    validationRef: {{ printf "%s.keycloak-db" $ns | quote }}
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+spec:
+  primarySpec:
+    adminUser:
+      passwordRef:
+        name: {{ .Values.secretNames.mpDbPassword }}
+    version: {{ .Values.managementPlane.db.version | quote }}
+    resources:
+      memory: {{ .Values.managementPlane.db.memory | quote }}
+      cpu: {{ .Values.managementPlane.db.cpu | quote }}
+      disks:
+        - name: DataDisk
+          size: {{ .Values.managementPlane.db.diskSize | quote }}
+---
+apiVersion: pki.security.gdc.goog/v1
+kind: Certificate
+metadata:
+  name: {{ .Values.fqdnPrefix }}-mp-cert
+  namespace: istio-system
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+    helm.sh/resource-policy: keep
+spec:
+  dnsNames:
+    - {{ printf "%s.%s" .Values.fqdnPrefix .Values.dnsSuffix }}
+    - {{ printf "%s.%s" .Values.fqdnPrefix .Values.globalDnsSuffix }}
+  duration: 8760h
+  renewBefore: 2160h
+  secretConfig:
+    secretName: {{ .Values.fqdnPrefix }}-mp-web-tls
+    secretTemplate:
+      annotations:
+        pki.security.gdc.goog/forward-to-cp: "true"
+    privateKeyConfig:
+      algorithm: RSA
+      size: 3072
+---
+apiVersion: network.private.gdc.goog/v1alpha1
+kind: DNSRegistration
+metadata:
+  name: {{ .Values.fqdnPrefix }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  fqdnPrefix: {{ .Values.fqdnPrefix }}
+  resolutionConfig:
+    exposeToNetwork: InfraExternalNetwork
+    resolveTo:
+      useDefaultIstioGateway:
+        owningCluster: InfraCluster
+        ingressLabel: infra
+---
+apiVersion: network.private.gdc.goog/v1alpha1
+kind: DNSRegistration
+metadata:
+  name: {{ .Values.fqdnPrefix }}-infra-internal
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  fqdnPrefix: {{ .Values.fqdnPrefix }}
+  resolutionConfig:
+    exposeToNetwork: VPC
+    vpcIdentifier: infra
+    resolveTo:
+      useDefaultIstioGateway:
+        owningCluster: InfraCluster
+        ingressLabel: infra
+---
+apiVersion: network.private.gdc.goog/v1alpha1
+kind: DNSRegistration
+metadata:
+  name: {{ .Values.fqdnPrefix }}-customer-internal
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  fqdnPrefix: {{ .Values.fqdnPrefix }}
+  resolutionConfig:
+    exposeToNetwork: VPC
+    vpcIdentifier: default
+    resolveTo:
+      useDefaultIstioGateway:
+        owningCluster: InfraCluster
+        ingressLabel: data
+---
+apiVersion: network.private.gdc.goog/v1alpha1
+kind: DNSRegistration
+metadata:
+  name: {{ .Values.fqdnPrefix }}-customer-external
+  namespace: {{ $ns }}
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  fqdnPrefix: {{ .Values.fqdnPrefix }}
+  resolutionConfig:
+    exposeToNetwork: CustomerExternalNetwork
+    resolveTo:
+      useDefaultIstioGateway:
+        owningCluster: InfraCluster
+        ingressLabel: data
+{{- end }}

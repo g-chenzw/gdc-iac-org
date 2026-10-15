@@ -1,0 +1,453 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Stage 3: Applied to Organization Control Plane (infra-cp)
+# Deploys internal PKCS12 TLS certificates, Keycloak StatefulSet, Services,
+# Istio Gateways (Infra + Customer/PA), DestinationRule, and VirtualService
+# (with route name 'open-paths' to bypass ais-ext-authz-session).
+# Prerequisite: Secrets (bundledidp-keycloak-database-pw, keycloak-cp-keystore-password,
+# bundledidp-local-admin-password) are created at runtime via scripts/deploy.sh.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keycloak-cp
+  namespace: pa-demo-keycloak
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+automountServiceAccountToken: true
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: bundledidp-keycloak-https-ca
+  namespace: pa-demo-keycloak
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  isCA: true
+  commonName: bundledidp-keycloak-https-ca.pa-demo-keycloak.svc.cluster.local
+  secretName: bundledidp-keycloak-https-ca
+  duration: 87600h
+  renewBefore: 8760h
+  issuerRef:
+    name: internal-root-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: keycloak-cp-ca-issuer
+  namespace: pa-demo-keycloak
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  ca:
+    secretName: bundledidp-keycloak-https-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: keycloak-cp-keycloak-https
+  namespace: pa-demo-keycloak
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  secretName: keycloak-cp-keycloak-https
+  duration: 8760h
+  renewBefore: 720h
+  subject:
+    organizations:
+      - gdch
+  commonName: pa-demo-keycloak
+  isCA: false
+  privateKey:
+    algorithm: RSA
+    encoding: PKCS1
+    size: 4096
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    - pa-demo-keycloak.gdchservices.zone1.gdc.example.com
+    - pa-demo-keycloak.gdchservices.gdc.example.com
+    - keycloak-cp-headless.pa-demo-keycloak.svc.cluster.local
+  issuerRef:
+    name: keycloak-cp-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+  keystores:
+    pkcs12:
+      create: true
+      passwordSecretRef:
+        name: keycloak-cp-keystore-password
+        key: password
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-cp-headless
+  namespace: pa-demo-keycloak
+  labels:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+    app.kubernetes.io/component: headless
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-cp-http
+  namespace: pa-demo-keycloak
+  labels:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+    app.kubernetes.io/component: http
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak-cp
+  namespace: pa-demo-keycloak
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+  labels:
+    app.kubernetes.io/name: keycloak-cp
+    app.kubernetes.io/instance: keycloak-cp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak-cp
+      app.kubernetes.io/instance: keycloak-cp
+  replicas: 1
+  serviceName: keycloak-cp-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keycloak-cp
+        app.kubernetes.io/instance: keycloak-cp
+        monitoring.gdc.goog/inject-proxy: keycloak-bundledidp-backend
+    spec:
+      serviceAccountName: keycloak-cp
+      securityContext:
+        fsGroup: 1000
+      enableServiceLinks: true
+      restartPolicy: Always
+      tolerations:
+        - key: "node-role.kubernetes.io/master"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node-role.kubernetes.io/control-plane"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node.kubernetes.io/disk-pressure"
+          operator: "Exists"
+          effect: "NoSchedule"
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        - name: dbchecker
+          image: "harbor.gdc.local/gpc-system/bundledidp-pgchecker:v1.0.0"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+          command:
+            - sh
+            - -c
+            - |
+              echo 'Waiting for Database pg-keycloak-db-ilb:5432 to become ready...'
+              until printf "." && nc -z -w 2 pg-keycloak-db-ilb 5432; do
+                sleep 2
+              done
+              echo 'Database OK ✓'
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "32Mi"
+            limits:
+              cpu: "20m"
+              memory: "32Mi"
+      containers:
+        - name: keycloak
+          image: "harbor.gdc.local/gpc-system/keycloak:v24.0.4"
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            seLinuxOptions:
+              type: "spc_t"
+          args:
+            - "-Djgroups.dns.query=keycloak-cp-headless.pa-demo-keycloak.svc.cluster.local"
+            - "--spi-events-listener-jboss-logging-success-level=info"
+            - "--spi-events-listener-jboss-logging-error-level=warn"
+            - '-Dquarkus.log.handler.file."EVENTS_LOGGING_FILE".enable=true'
+            - '-Dquarkus.log.handler.file."EVENTS_LOGGING_FILE".path=/var/log/events.log'
+            - '-Dquarkus.log.category."org.keycloak.events".level=INFO'
+            - '-Dquarkus.log.category."org.keycloak.events".handlers=EVENTS_LOGGING_FILE'
+            - "-Djava.security.properties=/opt/keycloak/conf/security/kc.java.security"
+            - "--log-level=INFO,org.keycloak.common.crypto:TRACE,org.keycloak.crypto:TRACE"
+          env:
+            - name: KC_HTTP_RELATIVE_PATH
+              value: "/keycloak"
+            - name: KC_CACHE
+              value: "ispn"
+            - name: KC_CACHE_STACK
+              value: "kubernetes"
+            - name: KC_PROXY_HEADERS
+              value: "forwarded"
+            - name: KC_DB
+              value: "postgres"
+            - name: KC_DB_URL_HOST
+              value: "pg-keycloak-db-ilb"
+            - name: KC_DB_URL_PORT
+              value: "5432"
+            - name: KC_DB_URL_DATABASE
+              value: "postgres"
+            - name: KC_DB_USERNAME
+              value: "dbsadmin"
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bundledidp-keycloak-database-pw
+                  key: password
+            - name: KC_METRICS_ENABLED
+              value: "true"
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_FEATURES
+              value: "fips"
+            - name: KC_LOG_LEVEL
+              value: "INFO,org.keycloak.common.crypto:TRACE,org.keycloak.crypto:TRACE"
+            - name: KEYCLOAK_ADMIN
+              value: "admin"
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bundledidp-local-admin-password
+                  key: secret
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            - name: KC_HOSTNAME_STRICT_HTTPS
+              value: "false"
+            - name: KC_HTTPS_CLIENT_AUTH
+              value: "request"
+            - name: KC_HTTPS_KEY_STORE_FILE
+              value: "/opt/keycloak/secrets/keystore.p12"
+            - name: KC_HTTPS_KEY_STORE_TYPE
+              value: "pkcs12"
+            - name: KC_HTTPS_KEY_STORE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-cp-keystore-password
+                  key: password
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: http-internal
+              containerPort: 9000
+              protocol: TCP
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: "/keycloak/health/live"
+              port: http-internal
+              scheme: HTTPS
+            initialDelaySeconds: 0
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: "/keycloak/health/ready"
+              port: http-internal
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            timeoutSeconds: 1
+          startupProbe:
+            httpGet:
+              path: "/keycloak/health"
+              port: http-internal
+              scheme: HTTPS
+            initialDelaySeconds: 15
+            timeoutSeconds: 1
+            failureThreshold: 60
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: "1Gi"
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+            - name: tls-config-volume
+              mountPath: /opt/keycloak/secrets
+              readOnly: true
+      volumes:
+        - name: varlog
+          emptyDir: {}
+        - name: tls-config-volume
+          secret:
+            secretName: keycloak-cp-keycloak-https
+            items:
+              - key: keystore.p12
+                path: keystore.p12
+              - key: ca.crt
+                path: ca.crt
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: keycloak-cp-headless-destination-rule
+  namespace: pa-demo-keycloak
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  host: keycloak-cp-headless.pa-demo-keycloak.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+      credentialName: trust-store-internal-only
+      sni: pa-demo-keycloak.gdchservices.zone1.gdc.example.com
+---
+# Infra Ingress Gateway (InfraExternalNetwork / IO External VIP)
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: keycloak-cp-gateway
+  namespace: pa-demo-keycloak
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  selector:
+    istio: infra-ingress-gateway
+  servers:
+    - port:
+        number: 443
+        name: https-443
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: pa-demo-keycloak-mp-web-tls
+      hosts:
+        - pa-demo-keycloak.gdchservices.zone1.gdc.example.com
+        - pa-demo-keycloak.gdchservices.gdc.example.com
+    - port:
+        number: 8443
+        name: https-8443
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: pa-demo-keycloak-mp-web-tls
+      hosts:
+        - pa-demo-keycloak.gdchservices.zone1.gdc.example.com
+        - pa-demo-keycloak.gdchservices.gdc.example.com
+---
+# Customer/Dataplane Ingress Gateway (CustomerExternalNetwork / PA Shared Network VIP)
+# Note: g-svc-dataplane-ingress-gateway-internal maps external port 443 -> Envoy targetPort 8443,
+# so binding both 443 and 8443 ensures seamless routing across all GDC versions.
+apiVersion: networking.istio.io/v1alpha3
+kind: Gateway
+metadata:
+  name: keycloak-cp-customer-gateway
+  namespace: pa-demo-keycloak
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  selector:
+    istio: dataplane-ingress-gateway
+  servers:
+    - port:
+        number: 443
+        name: https-443
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: pa-demo-keycloak-mp-web-tls
+      hosts:
+        - pa-demo-keycloak.gdchservices.zone1.gdc.example.com
+        - pa-demo-keycloak.gdchservices.gdc.example.com
+    - port:
+        number: 8443
+        name: https-8443
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: pa-demo-keycloak-mp-web-tls
+      hosts:
+        - pa-demo-keycloak.gdchservices.zone1.gdc.example.com
+        - pa-demo-keycloak.gdchservices.gdc.example.com
+---
+# VirtualService with route name 'open-paths' so GDC's EnvoyFilter exempts /keycloak from ais-ext-authz-session
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: keycloak-cp-virtualservice
+  namespace: pa-demo-keycloak
+  annotations:
+    lcm.private.gdc.goog/claim-by-force: "true"
+spec:
+  hosts:
+    - pa-demo-keycloak.gdchservices.zone1.gdc.example.com
+    - pa-demo-keycloak.gdchservices.gdc.example.com
+  gateways:
+    - keycloak-cp-gateway
+    - keycloak-cp-customer-gateway
+  http:
+    - name: open-paths
+      route:
+        - destination:
+            host: keycloak-cp-headless
+            port:
+              number: 8443

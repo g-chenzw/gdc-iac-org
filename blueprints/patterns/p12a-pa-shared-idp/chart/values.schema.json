@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Values schema for p12a-pa-shared-idp",
+  "type": "object",
+  "properties": {
+    "global": {
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string" },
+        "namespace": { "type": "string" },
+        "registry": { "type": "string" },
+        "imagePullSecrets": { "type": "array" },
+        "commonLabels": { "type": "object" },
+        "commonAnnotations": { "type": "object" }
+      }
+    },
+    "namespace": { "type": "string" },
+    "registry": { "type": "string" },
+    "fqdnPrefix": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "dnsSuffix": { "type": "string" },
+    "globalDnsSuffix": { "type": "string" },
+    "gdc": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "failover": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "apps": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "secretNames": {
+      "type": "object",
+      "properties": {
+        "mpDbPassword": { "type": "string" },
+        "cpDbPassword": { "type": "string" },
+        "keystorePassword": { "type": "string" },
+        "adminPassword": { "type": "string" },
+        "demoUserPassword": { "type": "string" }
+      }
+    },
+    "managementPlane": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "db": {
+          "type": "object",
+          "properties": {
+            "version": { "type": "string" },
+            "cpu": { "type": "string" },
+            "memory": { "type": "string" },
+            "diskSize": { "type": "string" }
+          }
+        }
+      }
+    },
+    "controlPlane": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "keycloakTag": { "type": "string" },
+        "pgcheckerTag": { "type": "string" },
+        "realmSetup": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "realm": { "type": "string" }
+          }
+        }
+      }
+    },
+    "tenantFederation": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "idpCertificateDataBase64Pem": { "type": "string" },
+        "groupPrefix": { "type": "string" },
+        "userPrefix": { "type": "string" },
+        "adminGroup": { "type": "string" },
+        "roleName": { "type": "string" }
+      }
+    }
+  }
+}

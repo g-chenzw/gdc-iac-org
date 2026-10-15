@@ -1,0 +1,84 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+suite: p12a-pa-shared-idp chart unit tests
+templates:
+  - templates/mp/resources.yaml
+  - templates/cp/workloads.yaml
+  - templates/tenant-org/federation.yaml
+tests:
+  - it: should render Control Plane (infra-cp) resources by default without static Secrets and with open-paths VirtualService
+    set:
+      global:
+        namespace: pa-demo-keycloak
+        registry: harbor.gdc.local/gpc-system
+      fqdnPrefix: pa-demo-keycloak
+    template: templates/cp/workloads.yaml
+    asserts:
+      - hasDocuments:
+          count: 12
+      - isKind:
+          of: ServiceAccount
+        documentIndex: 0
+      - isKind:
+          of: StatefulSet
+        documentIndex: 6
+      - isKind:
+          of: VirtualService
+        documentIndex: 10
+      - equal:
+          path: spec.http[0].name
+          value: open-paths
+        documentIndex: 10
+  - it: should not render Control Plane resources when apps.enabled is false
+    set:
+      apps:
+        enabled: false
+    template: templates/cp/workloads.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: should render Management Plane (infra-mp) DBCluster, Web TLS Certificate, and 4 DNSRegistrations when managementPlane.enabled is true
+    set:
+      managementPlane:
+        enabled: true
+      global:
+        namespace: pa-demo-keycloak
+    template: templates/mp/resources.yaml
+    asserts:
+      - hasDocuments:
+          count: 6
+      - isKind:
+          of: DBCluster
+        documentIndex: 0
+      - isKind:
+          of: Certificate
+        documentIndex: 1
+      - isKind:
+          of: DNSRegistration
+        documentIndex: 5
+  - it: should render Target Org SAML 2.0 IdentityProviderConfig and IAMRoleBinding when tenantFederation.enabled is true
+    set:
+      tenantFederation:
+        enabled: true
+        idpCertificateDataBase64Pem: "<base64-pem-cert-from-saml-descriptor>"
+    template: templates/tenant-org/federation.yaml
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: IdentityProviderConfig
+        documentIndex: 0
+      - isKind:
+          of: IAMRoleBinding
+        documentIndex: 1

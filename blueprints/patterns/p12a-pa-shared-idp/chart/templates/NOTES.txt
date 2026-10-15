@@ -1,0 +1,9 @@
+Pattern Chart: p12a-pa-shared-idp
+Target Namespace: {{ include "p12a-pa-shared-idp.namespace" . }}
+Target FQDN: https://{{ .Values.fqdnPrefix }}.{{ .Values.dnsSuffix }}/keycloak
+Image Registry: {{ include "p12a-pa-shared-idp.registry" . }}
+
+Execution Plane Status:
+- Management Plane (infra-mp): {{ or .Values.managementPlane.enabled .Values.gdc.enabled }}
+- Control Plane (infra-cp): {{ and .Values.controlPlane.enabled .Values.apps.enabled }}
+- Tenant Org SAML 2.0 Federation (global API): {{ .Values.tenantFederation.enabled }}

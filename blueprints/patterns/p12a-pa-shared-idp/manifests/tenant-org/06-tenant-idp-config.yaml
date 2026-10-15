@@ -1,0 +1,47 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Stage 5: Applied to Target Tenant Organization Global API Server
+# Replace <BASE64_ENCODED_PEM_CERTIFICATE> with the base64-encoded PEM X.509 signing
+# certificate retrieved from https://<fqdnPrefix>.<dnsSuffix>/keycloak/realms/<realm>/protocol/saml/descriptor
+apiVersion: iam.global.gdc.goog/v1
+kind: IdentityProviderConfig
+metadata:
+  name: pa-demo-keycloak-saml
+  namespace: platform
+spec:
+  saml:
+    idpEntityID: "https://pa-demo-keycloak.gdchservices.zone1.gdc.example.com/keycloak/realms/pa-demo"
+    idpSingleSignOnURI: "https://pa-demo-keycloak.gdchservices.zone1.gdc.example.com/keycloak/realms/pa-demo/protocol/saml"
+    idpCertificateDataList:
+      - "<BASE64_ENCODED_PEM_CERTIFICATE>"
+    userAttribute: "email"
+    groupsAttribute: "groups"
+    groupPrefix: "pa-kc-"
+    userPrefix: "pa-kc-"
+---
+apiVersion: iam.global.gdc.goog/v1
+kind: IAMRoleBinding
+metadata:
+  name: pa-demo-keycloak-saml-rb
+  namespace: platform
+spec:
+  roleRef:
+    apiGroup: iam.global.gdc.goog
+    kind: IAMRole
+    name: organization-iam-admin
+  subjects:
+    - apiGroup: rbac.authorization.k8s.io
+      kind: Group
+      name: pa-kc-pa-admins

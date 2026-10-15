@@ -1,0 +1,51 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+{{- if .Values.tenantFederation.enabled }}
+{{- $realm := .Values.controlPlane.realmSetup.realm }}
+{{- $idpBaseUrl := printf "https://%s.%s/keycloak/realms/%s" .Values.fqdnPrefix .Values.dnsSuffix $realm }}
+apiVersion: iam.global.gdc.goog/v1
+kind: IdentityProviderConfig
+metadata:
+  name: {{ .Values.fqdnPrefix }}-saml
+  namespace: platform
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+spec:
+  saml:
+    idpEntityID: {{ $idpBaseUrl | quote }}
+    idpSingleSignOnURI: {{ printf "%s/protocol/saml" $idpBaseUrl | quote }}
+    idpCertificateDataList:
+      - {{ required "tenantFederation.idpCertificateDataBase64Pem is required when tenantFederation.enabled=true" .Values.tenantFederation.idpCertificateDataBase64Pem | quote }}
+    userAttribute: "email"
+    groupsAttribute: "groups"
+    groupPrefix: {{ .Values.tenantFederation.groupPrefix | quote }}
+    userPrefix: {{ .Values.tenantFederation.userPrefix | quote }}
+---
+apiVersion: iam.global.gdc.goog/v1
+kind: IAMRoleBinding
+metadata:
+  name: {{ .Values.fqdnPrefix }}-saml-rb
+  namespace: platform
+  labels:
+    {{- include "p12a-pa-shared-idp.labels" . | nindent 4 }}
+spec:
+  roleRef:
+    apiGroup: iam.global.gdc.goog
+    kind: IAMRole
+    name: {{ .Values.tenantFederation.roleName }}
+  subjects:
+    - apiGroup: rbac.authorization.k8s.io
+      kind: Group
+      name: {{ printf "%s%s" .Values.tenantFederation.groupPrefix .Values.tenantFederation.adminGroup }}
+{{- end }}

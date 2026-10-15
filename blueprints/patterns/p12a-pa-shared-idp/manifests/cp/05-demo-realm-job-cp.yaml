@@ -1,0 +1,191 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Stage 4: Applied to Organization Control Plane (infra-cp)
+# Seeds the shared Realm ('pa-demo'), PA/AO RBAC groups ('pa-admins', 'ao-users', 'iam-admins'),
+# and initial PA/AO users ('pa-admin@example.com', 'pa-auditor@example.com', 'ao-developer@example.com')
+# using Keycloak's built-in kcadm.sh CLI.
+# Prerequisite: Secrets (bundledidp-local-admin-password, bundledidp-initial-user-password)
+# are created at runtime via scripts/deploy.sh.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: keycloak-pa-demo-setup
+  namespace: pa-demo-keycloak
+  labels:
+    app.kubernetes.io/part-of: p12a-pa-shared-idp
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keycloak-pa-demo-setup
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: keycloak-cp
+      securityContext:
+        runAsUser: 1000
+        runAsNonRoot: true
+      containers:
+        - name: seed-realm-and-users
+          image: "harbor.gdc.local/gpc-system/keycloak:v24.0.4"
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -ec
+            - |
+              export KC_SERVER="https://keycloak-cp-headless.pa-demo-keycloak.svc.cluster.local:8443/keycloak"
+              export KCADM="/opt/keycloak/bin/kcadm.sh"
+              export TRUSTSTORE="/tmp/kcadm-truststore.p12"
+              export CONFIG_FILE="/tmp/kcadm.config"
+              export REALM="pa-demo"
+              export TRUSTPASS="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+              trap 'rm -f "${TRUSTSTORE}" "${CONFIG_FILE}"' EXIT
+
+              echo "[1/5] Preparing ephemeral PKCS12 truststore from internal CA certificate..."
+              rm -f "${TRUSTSTORE}" "${CONFIG_FILE}"
+              keytool -importcert -noprompt \
+                -alias keycloak-internal-ca \
+                -file /opt/keycloak/secrets/ca.crt \
+                -keystore "${TRUSTSTORE}" \
+                -storetype PKCS12 \
+                -storepass "${TRUSTPASS}"
+
+              echo "[2/5] Authenticating to Keycloak master realm at ${KC_SERVER}..."
+              until "${KCADM}" config credentials \
+                --server "${KC_SERVER}" \
+                --realm master \
+                --user admin \
+                --password "${KEYCLOAK_ADMIN_PASSWORD}" \
+                --truststore "${TRUSTSTORE}" \
+                --trustpass "${TRUSTPASS}" \
+                --config "${CONFIG_FILE}"; do
+                echo "Waiting for Keycloak Admin API to accept credentials..."
+                sleep 5
+              done
+
+              echo "[3/5] Ensuring realm '${REALM}' exists..."
+              if "${KCADM}" get "realms/${REALM}" --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}" >/dev/null 2>&1; then
+                echo "Realm '${REALM}' already exists."
+              else
+                "${KCADM}" create realms \
+                  -s "realm=${REALM}" \
+                  -s "id=${REALM}" \
+                  -s "enabled=true" \
+                  -s "displayName=GDC Air-Gapped PA Shared IdP" \
+                  -s "sslRequired=external" \
+                  --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}"
+                echo "Created realm '${REALM}'."
+              fi
+
+              echo "[4/5] Ensuring PA/AO groups exist in realm '${REALM}'..."
+              ensure_group() {
+                local grp="$1"
+                local gid
+                gid=$("${KCADM}" get groups -r "${REALM}" -q "search=${grp}" \
+                  --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}" \
+                  | grep -B2 -A2 "\"name\" : \"${grp}\"" | grep '"id"' | head -n1 | sed -E 's/.*"id" : "([^"]+)".*/\1/' || true)
+                if [[ -z "${gid}" ]]; then
+                  "${KCADM}" create groups -r "${REALM}" -s "name=${grp}" \
+                    --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}" >/dev/null
+                  echo "Created group '${grp}'."
+                else
+                  echo "Group '${grp}' already exists (id=${gid})."
+                fi
+              }
+              ensure_group "pa-admins"
+              ensure_group "iam-admins"
+              ensure_group "ao-users"
+
+              echo "[5/5] Ensuring PA/AO users and group memberships exist..."
+              ensure_user() {
+                local username="$1"
+                local firstname="$2"
+                local lastname="$3"
+                shift 3
+                local groups=("$@")
+
+                local uid
+                uid=$("${KCADM}" get users -r "${REALM}" -q "username=${username}" -q "exact=true" \
+                  --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}" \
+                  | grep '"id"' | head -n1 | sed -E 's/.*"id" : "([^"]+)".*/\1/' || true)
+
+                if [[ -z "${uid}" ]]; then
+                  "${KCADM}" create users -r "${REALM}" \
+                    -s "username=${username}" \
+                    -s "email=${username}" \
+                    -s "firstName=${firstname}" \
+                    -s "lastName=${lastname}" \
+                    -s "enabled=true" \
+                    -s "emailVerified=true" \
+                    --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}" >/dev/null
+
+                  uid=$("${KCADM}" get users -r "${REALM}" -q "username=${username}" -q "exact=true" \
+                    --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}" \
+                    | grep '"id"' | head -n1 | sed -E 's/.*"id" : "([^"]+)".*/\1/' || true)
+                  echo "Created user '${username}' (id=${uid})."
+                else
+                  echo "User '${username}' already exists (id=${uid})."
+                fi
+
+                "${KCADM}" set-password -r "${REALM}" \
+                  --username "${username}" \
+                  --new-password "${DEMO_USER_PASSWORD}" \
+                  --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}"
+
+                for grp in "${groups[@]}"; do
+                  local gid
+                  gid=$("${KCADM}" get groups -r "${REALM}" -q "search=${grp}" \
+                    --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}" \
+                    | grep -B2 -A2 "\"name\" : \"${grp}\"" | grep '"id"' | head -n1 | sed -E 's/.*"id" : "([^"]+)".*/\1/' || true)
+                  if [[ -n "${uid}" && -n "${gid}" ]]; then
+                    "${KCADM}" update "users/${uid}/groups/${gid}" -r "${REALM}" \
+                      -s "realm=${REALM}" -s "userId=${uid}" -s "groupId=${gid}" -n \
+                      --truststore "${TRUSTSTORE}" --trustpass "${TRUSTPASS}" --config "${CONFIG_FILE}" >/dev/null || true
+                    echo "  -> Added '${username}' to group '${grp}'."
+                  fi
+                done
+              }
+
+              ensure_user "pa-admin@example.com" "PA" "Admin" "pa-admins" "iam-admins"
+              ensure_user "pa-auditor@example.com" "PA" "Auditor" "pa-admins"
+              ensure_user "ao-developer@example.com" "AO" "Developer" "ao-users"
+
+              echo "=================================================================="
+              echo "Realm '${REALM}' and PA/AO users/groups are ready."
+              echo "=================================================================="
+          env:
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bundledidp-local-admin-password
+                  key: secret
+            - name: DEMO_USER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bundledidp-initial-user-password
+                  key: secret
+          volumeMounts:
+            - name: tls-ca-volume
+              mountPath: /opt/keycloak/secrets/ca.crt
+              subPath: ca.crt
+              readOnly: true
+      volumes:
+        - name: tls-ca-volume
+          secret:
+            secretName: keycloak-cp-keycloak-https
+            items:
+              - key: ca.crt
+                path: ca.crt
