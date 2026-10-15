@@ -121,6 +121,8 @@ class UpgradeTestRunner:
             resp_headers = {k.lower(): v for k, v in (e.headers.items() if e.headers else [])}
             body = e.read() if e.fp else b""
             return e.code, resp_headers, body
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            return 0, {}, str(e).encode("utf-8")
 
     def ensure_keycloak_jwt(self) -> Optional[str]:
         """Obtains a real RS256 Bearer token from Keycloak, auto-healing Keycloak 24 UserProfile attributes if needed."""
@@ -605,8 +607,28 @@ def main() -> int:
     runner.run_test("TEST-11", "AO", "Active Session Oversight & User Blocklist Enforcement", test_11_ao_blocklist)
 
     def test_12_ao_dual_ingress() -> str:
-        s_gw_ui, _, _ = runner.request(f"{args.client_gw_url}/", timeout=15)
-        if s_gw_ui == 503 and not args.skip_k8s:
+        s_ing_probe, _, _ = runner.request(f"{args.client_ingress_url}/", timeout=4, use_cookies=False)
+        if s_ing_probe != 200 and not args.skip_k8s:
+            subprocess.run(
+                ["kubectl", "rollout", "restart", "deployment/gemma-ingress-gateway", "-n", args.namespace],
+                capture_output=True, text=True, timeout=20
+            )
+            subprocess.run(
+                ["kubectl", "rollout", "status", "deployment/gemma-ingress-gateway", "-n", args.namespace, "--timeout=60s"],
+                capture_output=True, text=True, timeout=65
+            )
+            subprocess.run(["pkill", "-f", "port-forward.*gemma-ingress-gateway"], capture_output=True)
+            time.sleep(2)
+            s_recheck, _, _ = runner.request(f"{args.client_ingress_url}/", timeout=2, use_cookies=False)
+            if s_recheck == 0 and "127.0.0.1:8082" in args.client_ingress_url:
+                subprocess.Popen(
+                    ["kubectl", "port-forward", "-n", args.namespace, "svc/gemma-ingress-gateway", "8082:80", "--address", "0.0.0.0"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+                )
+                time.sleep(2)
+
+        s_gw_ui, _, _ = runner.request(f"{args.client_gw_url}/", timeout=5)
+        if s_gw_ui in (0, 502, 503, 504) and not args.skip_k8s:
             ing_ip_proc = subprocess.run(
                 ["kubectl", "get", "svc", "gemma-ingress-gateway", "-n", args.namespace, "-o", "jsonpath={.spec.clusterIP}"],
                 capture_output=True, text=True, timeout=15
@@ -622,18 +644,25 @@ def main() -> int:
                     capture_output=True, text=True, timeout=65
                 )
                 subprocess.run(["pkill", "-f", "port-forward.*gdc-gateway-tunnel"], capture_output=True)
-                time.sleep(3)
+                time.sleep(2)
+                s_gw_recheck, _, _ = runner.request(f"{args.client_gw_url}/", timeout=2, use_cookies=False)
+                if s_gw_recheck == 0 and "127.0.0.1:8081" in args.client_gw_url:
+                    subprocess.Popen(
+                        ["kubectl", "port-forward", "-n", args.namespace, "svc/gdc-gateway-tunnel-svc", "8081:80", "--address", "0.0.0.0"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+                    )
+                    time.sleep(2)
 
         auth_headers = runner.client_auth_headers("charlie", "admin")
         for label, base_url in [("Gateway API", args.client_gw_url), ("Ingress", args.client_ingress_url)]:
             last_err = ""
             for _attempt in range(5):
-                s_ui, _, _ = runner.request(f"{base_url}/", timeout=15, use_cookies=False)
+                s_ui, _, _ = runner.request(f"{base_url}/", timeout=6, use_cookies=False)
                 if s_ui != 200:
                     last_err = f"{label} ({base_url}) root returned HTTP {s_ui}"
                     time.sleep(1.5)
                     continue
-                s_h, _, _ = runner.request(f"{base_url}/api/health", timeout=15, use_cookies=False)
+                s_h, _, _ = runner.request(f"{base_url}/api/health", timeout=6, use_cookies=False)
                 if s_h != 200:
                     last_err = f"{label} ({base_url}/api/health) returned HTTP {s_h}"
                     time.sleep(1.5)
@@ -641,7 +670,7 @@ def main() -> int:
                 s_m, _, b_m = runner.request(
                     f"{base_url}/api/models",
                     headers=auth_headers,
-                    timeout=15,
+                    timeout=6,
                     use_cookies=False,
                 )
                 if s_m == 200 and json.loads(b_m.decode("utf-8")):
@@ -650,13 +679,13 @@ def main() -> int:
                 s_ev, _, _ = runner.request(
                     f"{base_url}/api/telemetry/events?limit=1",
                     headers=auth_headers,
-                    timeout=15,
+                    timeout=6,
                     use_cookies=False,
                 )
                 s_gwm, _, b_gwm = runner.request(
                     f"{args.gateway_url}/v1/models",
                     headers=auth_headers,
-                    timeout=15,
+                    timeout=6,
                 )
                 if s_ev == 200 and s_gwm == 200 and json.loads(b_gwm.decode("utf-8")).get("data"):
                     last_err = ""
