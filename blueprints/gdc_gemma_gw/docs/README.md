@@ -10,11 +10,9 @@ All documentation for the **Gemma 4 Dedicated Inference Gateway (`gdc_gemma_gw`)
 docs/
 ├── README.md                                              # Master Documentation Hub (this file)
 ├── tutorials/                                             # Step-by-Step End-to-End Tutorials & Interactive Demo Guides
-│   ├── ai_enabled_e2e_gcp_staging_guide.md                # Full AI-Enabled Blueprint E2E Deployment on GCP/GKE Staging
 │   ├── ai_enabled_e2e_gdc_production_iac_guide.md         # Full AI-Enabled Blueprint E2E Deployment on GDC-ag (gdc-iac-org)
 │   ├── gui_demo_walkthrough_and_prompts.md                # Interactive Browser Walkthrough & Copy-Paste Demo Prompts (Ports 8080–8084)
 │   ├── e2e_zero_tweak_validation_runbook.md               # Automated IO/AO Upgrade & E2E Functional Verification Runbook
-│   └── quickstart_on_GCP.md                               # Standalone Gateway + Chat Client Quickstart on GCP/GKE
 ├── architecture/                                          # Reference Architectures, Routing Design, Sizing & Security
 │   ├── Solution-Reference-Implementation-Gemma4-Inference-Gateway.md
 │   ├── Solution-Reference-Implementation-Gemma4-Client-Application.md
@@ -33,7 +31,6 @@ docs/
 └── testing/                                               # Testing Strategies, Automated QA & Air-Gap Validation
     ├── automated-testing-guide.md
     ├── testing-methodology.md
-    └── gcp-sandbox-keycloak-testing-strategy.md
 ```
 
 ---
@@ -42,11 +39,9 @@ docs/
 
 | Guide | Target Environment | Description |
 | :--- | :--- | :--- |
-| **[AI-Enabled Blueprint E2E Guide (GCP Staging)](./tutorials/ai_enabled_e2e_gcp_staging_guide.md)** | GCP / GKE Staging | Complete end-to-end deployment and verification of Gemma Gateway (`8080`), Joint Intelligence & Chat Client (`8081`/`8082`), Kafka (`P4`), RAG (`P6`), SQL Analyst (`P7`), Keycloak (`P12`), and `gdc-dev` (`8083`/`8084`). |
 | **[AI-Enabled Blueprint E2E Guide (GDC-ag Production IaC)](./tutorials/ai_enabled_e2e_gdc_production_iac_guide.md)** | GDC Air-Gapped (`gdc-iac-org`) | Declarative multi-stage Helmfile (`0-bootstrap` $\rightarrow$ `5-workload-factory`) production deployment on GDC-ag. |
 | **[GUI Functional Walkthrough & Live Demo Playbook](./tutorials/gui_demo_walkthrough_and_prompts.md)** | Both (GCP & GDC-ag) | Interactive browser walkthrough across all 5 ports (`8080`–`8084`) with copy-pasteable prompts to trigger `26B MoE` vs. `31B Dense` routing, RAG citations, Text-to-SQL, and `gdc-dev` IDE Swarm. |
 | **[Zero-Tweak E2E Validation & IO/AO Upgrade Runbook](./tutorials/e2e_zero_tweak_validation_runbook.md)** | Both (GCP & GDC-ag) | Automated 17-check (`verify-e2e-gcp-staging.py`) and 20-check (`verify-e2e-gdc-ag.py`) verification suites for Infrastructure Operators (IO) and Application Operators (AO). |
-| **[Standalone Gateway & Client GCP Quickstart](./tutorials/quickstart_on_GCP.md)** | GCP / GKE Staging | Focused quickstart for provisioning GKE GPU node pools and deploying only the Gemma 4 Gateway and Chat Client. |
 
 ---
 
@@ -83,4 +78,3 @@ docs/
 | :--- | :--- |
 | **[Automated Testing & QA Guide](./testing/automated-testing-guide.md)** | Running unit tests, integration tests (`pytest`), and streaming load tests (`Locust`). |
 | **[GDC Air-Gapped Testing Methodology](./testing/testing-methodology.md)** | Terminal-only in-cluster smoke tests and KubeDNS verification for disconnected GDC-ag racks. |
-| **[GCP Sandbox & Keycloak Testing Strategy](./testing/gcp-sandbox-keycloak-testing-strategy.md)** | Stepping-stone validation strategy for testing OIDC PKCE and single-origin routing on Cloud Workstations before air-gapped deployment. |
