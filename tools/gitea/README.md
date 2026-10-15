@@ -39,6 +39,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: gitea-data
+  namespace: ${NAMESPACE:?}
   labels:
     app: gitea
 spec:
@@ -51,6 +52,7 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  namespace: ${NAMESPACE:?}
   name: gitea
   labels:
     app: gitea
@@ -87,6 +89,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  namespace: ${NAMESPACE:?}
   name: gitea
 spec:
   type: ClusterIP
@@ -101,100 +104,6 @@ spec:
       targetPort: 22
 EOF
 ```
-
-### Step 1.2: Create Gitea Actions Runner Manifest (`gitea-runner.yaml`)
-
-This manifest defines `act_runner` with a Docker-in-Docker (`dind`) sidecar container so container-based workflow jobs can run inside the Kubernetes pod:
-
-```bash
-cat <<EOF > gitea-runner.yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: gitea-runner-data
-  labels:
-    app: gitea-runner
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 1Gi
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: gitea-runner
-  labels:
-    app: gitea-runner
-spec:
-  replicas: 1
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app: gitea-runner
-  template:
-    metadata:
-      labels:
-        app: gitea-runner
-    spec:
-      imagePullSecrets:
-        - name: harbor001-creds
-      containers:
-        - name: runner
-          image: gitea/act_runner:latest
-          command: ["sh", "-c", "while ! nc -z localhost 2376 </dev/null; do echo 'Waiting for docker daemon...'; sleep 2; done; /sbin/tini -- run.sh"]
-          env:
-            - name: DOCKER_HOST
-              value: tcp://localhost:2376
-            - name: DOCKER_CERT_PATH
-              value: /certs/client
-            - name: DOCKER_TLS_VERIFY
-              value: "1"
-            - name: GITEA_INSTANCE_URL
-              value: http://gitea.${NAMESPACE:?}.svc:80
-            - name: GITEA_RUNNER_REGISTRATION_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: gitea-runner-secret
-                  key: GITEA_RUNNER_REGISTRATION_TOKEN
-            - name: GITEA_RUNNER_NAME
-              value: k8s-standard-runner
-            - name: CONFIG_FILE
-              value: /config/config.yaml
-          volumeMounts:
-            - name: docker-certs
-              mountPath: /certs
-            - name: runner-data
-              mountPath: /data
-            - name: runner-config
-              mountPath: /config
-              readOnly: true
-        - name: daemon
-          image: library/docker:dind
-          env:
-            - name: DOCKER_TLS_CERTDIR
-              value: /certs
-          securityContext:
-            privileged: true
-          volumeMounts:
-            - name: docker-certs
-              mountPath: /certs
-      volumes:
-        - name: docker-certs
-          emptyDir: {}
-        - name: runner-data
-          persistentVolumeClaim:
-            claimName: gitea-runner-data
-        - name: runner-config
-          configMap:
-            name: gitea-runner-config
-EOF
-```
-
-> **Alternative (Rootless / Host-Mode Runner without DinD):**
-> If your cluster security policies disallow `privileged: true` containers, omit the `daemon` (`library/docker:dind`) container and `DOCKER_*` environment variables, set `command: ["/sbin/tini", "--", "run.sh"]`, and configure `labels: ["self-hosted:host"]` in `gitea-runner-config` (Step 5.2). Jobs referencing `runs-on: self-hosted` will execute directly inside the `runner` container process space.
 
 ---
 
@@ -211,9 +120,6 @@ docker login -u "${HARBOR_USER:?}" -p "${HARBOR_SECRET:?}" "${REGISTRY:?}"
   --manifest gitea.yaml \
   --registry "${REGISTRY:?}/${HARBOR_PROJECT:?}"
 
-../mirror-images/mirror_images.py \
-  --manifest gitea-runner.yaml \
-  --registry "${REGISTRY:?}/${HARBOR_PROJECT:?}"
 ```
 
 ### Mirror Workflow Job Images / Manual Image Push
@@ -222,6 +128,7 @@ For workflow job images not referenced directly in the Pod `image:` fields (such
 
 ```bash
 for IMAGE in \
+  "gitea/runner:nightly" \
   "gitea/runner-images:ubuntu-latest" \
   "ghcr.io/helmfile/helmfile:v1.2.1" \
   "bitnami/kubectl:latest" 
@@ -238,7 +145,7 @@ done
 Update the `image:` fields in `gitea.yaml` and `gitea-runner.yaml` to point to your Harbor registry:
 
 ```bash
-sed -i -E "s@(image:[[:space:]]+).*/@\1${REGISTRY:?}/${HARBOR_PROJECT:?}/@g" gitea.yaml gitea-runner.yaml
+sed -i -E "s@(image:[[:space:]]+).*/@\1${REGISTRY:?}/${HARBOR_PROJECT:?}/@g" gitea.yaml
 ```
 
 ---
@@ -310,14 +217,6 @@ Obtain an instance-wide runner registration token from the running Gitea instanc
 - **Option B — Via Web UI:**
   Log in as Administrator, go to **Site Administration** -> **Actions** -> **Runners**, click **Create new Runner**, and copy the **Registration Token**.
 
-Create a Kubernetes Secret in the `${NAMESPACE:?}` namespace with the token:
-
-```bash
-kubectl create secret generic gitea-runner-secret \
-    --from-literal=GITEA_RUNNER_REGISTRATION_TOKEN="${RUNNER_TOKEN:?}" \
-    -n "${NAMESPACE:?}"
-```
-
 ### Step 5.2: Create Runner Configuration (`ConfigMap`)
 
 In an air-gapped environment, `act_runner` must be configured to pull workflow job container images from your internal Harbor registry rather than Docker Hub.
@@ -330,27 +229,39 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: gitea-runner-config
+  namespace: ${NAMESPACE:?}
   labels:
     app: gitea-runner
 data:
   config.yaml: |
-    log:
-      level: info
-    runner:
-      file: .runner
-      capacity: 2
-      timeout: 3h
-      insecure: true
-      fetch_timeout: 5s
-      fetch_interval: 2s
-      labels:
-        - "ubuntu-latest:docker://${REGISTRY:?}/${HARBOR_PROJECT:?}/runner-images:ubuntu-latest"
-        - "helmfile:docker://${REGISTRY:?}/${HARBOR_PROJECT:?}/helmfile:v1.2.1"
-        - "self-hosted:host"
-    container:
-      network: ""
-      privileged: false
-      valid_volumes: []
+      log:
+        level: info
+      runner:
+        labels:
+          - "ubuntu-latest:kubernetes://${REGISTRY:?}/${HARBOR_PROJECT:?}/runner:nightly"
+          - "helmfile:kubernetes://${REGISTRY:?}/${HARBOR_PROJECT:?}/helmfile:v1.2.1"
+          - "kubectl:kubernetes://${REGISTRY:?}/${HARBOR_PROJECT:?}/kubectl:latest"
+          - "self-hosted:host"
+      kubernetes:
+        pod_template:
+          spec:
+            imagePullSecrets:
+              - name: harbor001-creds
+            volumes:
+              - name: kubeconfig-volume
+                secret:
+                  secretName: kubeconfig
+                  items:
+                    - key: config
+                      path: config
+            containers:
+              - name: job
+                env:
+                  - name: KUBECONFIG
+                    value: /root/.kube/config
+                volumeMounts:
+                  - name: kubeconfig-volume
+                    mountPath: /root/.kube
 EOF
 ```
 
@@ -360,14 +271,126 @@ Configure access secrets to store [kubeconfigs created during the bootstrap](../
 kubectl -n ${NAMESPACE:?} create secret generic kubeconfig \
   --from-file=config=${MERGED_KUBECONFIG:?}
 ```
+> Note: 
+> You can refresh the kubeconfig by running [../bootstrap/authenticate.sh](../../bootstrap/authenticate.sh) and updating the secret:
+>```bash
+>kubectl -n ${NAMESPACE:?} create secret generic kubeconfig \
+>  --from-file=config=${MERGED_KUBECONFIG:?} \
+>  --dry-run=client -o yaml | kubectl apply -f -
+>```
+
+### Step 5.4: Create Gitea Actions Runner (`gitea-runner.yaml`)
+
+This manifest defines `act_runner` on kubernetes. See [Kubernetes - gitea/runner](https://gitea.com/gitea/runner/src/branch/main/docs/kubernetes.md) for reference.
+```bash
+cat <<EOF > gitea-runner.yaml
+apiVersion: v1
+data:
+  token: "$(base64 -w 0 <<< "${RUNNER_TOKEN:?}")"
+kind: Secret
+metadata:
+  name: runner-secret
+  namespace: ${NAMESPACE:?}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: runner
+  namespace: ${NAMESPACE:?}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: runner
+  namespace: ${NAMESPACE:?}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "get", "list", "delete"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create", "get"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: runner
+  namespace: ${NAMESPACE:?}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: runner
+subjects:
+- kind: ServiceAccount
+  name: runner
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: runner
+  namespace: ${NAMESPACE:?}
+spec:
+  serviceName: runner
+  selector:
+    matchLabels:
+      app: runner
+  template:
+    metadata:
+      labels:
+        app: runner
+    spec:
+      serviceAccountName: runner
+      terminationGracePeriodSeconds: 10800 # keep above runner.shutdown_timeout, see README
+      imagePullSecrets:
+        - name: harbor001-creds
+      containers:
+      - name: runner
+        image: ${REGISTRY:?}/${HARBOR_PROJECT:?}/runner:nightly
+        env:
+        - name: GITEA_INSTANCE_URL
+          value: http://gitea.${NAMESPACE:?}.svc:80
+        - name: GITEA_RUNNER_REGISTRATION_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: runner-secret
+              key: token
+        - name: CONFIG_FILE
+          value: /config/config.yaml
+        - name: KUBECONFIG
+          value: /.kube/config
+        volumeMounts:
+        - name: config-volume
+          mountPath: /config
+          readOnly: true
+        - name: kubeconfig-volume
+          mountPath: /.kube
+          readOnly: true
+        - name: data-volume
+          mountPath: /data
+      volumes:
+      - name: config-volume
+        configMap:
+          name: gitea-runner-config
+      - name: data-volume
+        emptyDir: {}
+      - name: kubeconfig-volume
+        secret:
+          secretName: kubeconfig
+EOF
+```
 
 ### Step 5.4: Deploy the Runner on the Standard Cluster
 
-Apply `gitea-runner.yaml` (created in Step 1.2 and updated in Step 2):
+Apply `gitea-runner.yaml`:
 
 ```bash
 kubectl apply -n "${NAMESPACE:?}" -f gitea-runner.yaml
-kubectl rollout status deployment/gitea-runner -n "${NAMESPACE:?}"
 ```
 
 ---
@@ -377,7 +400,7 @@ kubectl rollout status deployment/gitea-runner -n "${NAMESPACE:?}"
 ### Check Runner Logs and Status
 
 ```bash
-kubectl logs -n "${NAMESPACE:?}" deploy/gitea-runner -c runner
+kubectl logs -n "${NAMESPACE:?}" statefulset/gitea-runner -c runner
 ```
 
 You should see output indicating that the runner registered successfully and is polling for jobs:
@@ -399,13 +422,22 @@ name: Verify GDC Standard Cluster Runner
 on: [push]
 
 jobs:
-  smoke-test:
+  job-test:
     runs-on: self-hosted
     steps:
       - name: Check Runner Environment
         run: |
           uname -a
           whoami
+  kubectl-test:
+    runs-on: kubectl
+    steps:
+      - name: kubectl contexts
+        run: |
+          kubectl config get-contexts
+      - name: kubectl crds
+        run: |
+          kubectl get crds
 ```
 ---
 
