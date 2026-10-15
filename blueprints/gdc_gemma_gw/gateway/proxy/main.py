@@ -1941,6 +1941,19 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
         )
         payload["messages"] = flatten_system_message(payload["messages"])
 
+    include_thinking = payload.get("think", True) is not False
+
+    # Normalize payload for vLLM OpenAI server compatibility:
+    # 1. Strip Ollama-only top-level 'think' flag (vLLM Pydantic extra='forbid' rejects it with HTTP 400 on both GKE and GDC-ag)
+    # 2. Preserve full max_tokens by default for GDC-ag production (maxModelLen=32768), only clamping upfront if VLLM_MAX_COMPLETION_TOKENS is explicitly set
+    if ACTIVE_FRAMEWORK == "vllm" or "vllm" in target_url or ENVOY_INFERENCE_POOL_ENABLED:
+        payload.pop("think", None)
+        vllm_max_env = os.getenv("VLLM_MAX_COMPLETION_TOKENS", "").strip()
+        if vllm_max_env and isinstance(payload.get("max_tokens"), int):
+            vllm_max_tokens = int(vllm_max_env)
+            if payload["max_tokens"] > vllm_max_tokens:
+                payload["max_tokens"] = vllm_max_tokens
+
     # Create/Update Active Session details
     ACTIVE_SESSIONS[session_id] = {
         "session_id": session_id,
@@ -2026,18 +2039,19 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                                     except Exception:
                                         pass
 
-                                    if "System role not supported" in error_msg:
-                                        logger.warning(
-                                            f"Detected System role limitation on backend {determined_tag}. Registering capability and retrying..."
-                                        )
-                                        UNSUPPORTED_SYSTEM_ROLE_MODELS.add(determined_tag)
-                                        persist_shared_state()
-
-                                        # Flatten system message and retry in-flight
+                                    if "System role not supported" in error_msg or "maximum context length" in error_msg.lower():
                                         retry_payload = current_payload.copy()
-                                        retry_payload["messages"] = flatten_system_message(
-                                            current_payload["messages"]
-                                        )
+                                        if "System role not supported" in error_msg:
+                                            logger.warning(
+                                                f"Detected System role limitation on backend {determined_tag}. Registering capability and retrying..."
+                                            )
+                                            UNSUPPORTED_SYSTEM_ROLE_MODELS.add(determined_tag)
+                                            persist_shared_state()
+                                            retry_payload["messages"] = flatten_system_message(
+                                                current_payload["messages"]
+                                            )
+                                        if "maximum context length" in error_msg.lower():
+                                            retry_payload["max_tokens"] = 512
 
                                         async with client.stream(
                                             "POST",
@@ -2159,7 +2173,6 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                 msg["content"] = reasoning
         return body
 
-    include_thinking = payload.get("think", True) is not False
     ACTIVE_COMPLETIONS_COUNT += 1
     try:
         async with borrow_http_client(timeout) as client:
@@ -2174,6 +2187,8 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                 if not alt_base:
                     raise
                 alt_target_url = f"{alt_base}/v1/chat/completions"
+                if "vllm" in alt_target_url:
+                    payload.pop("think", None)
                 logger.warning(
                     f"Primary backend {target_url} unreachable ({primary_err}); failing over to {alt_target_url}"
                 )
@@ -2181,23 +2196,25 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
                 target_url = alt_target_url
                 base_url = alt_base
 
-            # Catch system role limitation on non-streaming and register/retry
+            # Catch system role or context length limitation on non-streaming and register/retry
             if response.status_code == 400:
                 try:
                     error_json = response.json()
                     logger.info(f"[Retry Engine] Downstream 400 raw body: {error_json}")
-                    error_msg = error_json.get("error", {}).get("message", "")
-                    if "System role not supported" in error_msg:
-                        logger.warning(
-                            f"Detected System role limitation on backend {determined_tag} in non-streaming call. Retrying with flattened payload..."
-                        )
-                        UNSUPPORTED_SYSTEM_ROLE_MODELS.add(determined_tag)
-                        persist_shared_state()
-
+                    error_msg = error_json.get("error", {}).get("message", "") or str(error_json)
+                    if "System role not supported" in error_msg or "maximum context length" in error_msg.lower():
                         retry_payload = payload.copy()
-                        retry_payload["messages"] = flatten_system_message(
-                            payload["messages"]
-                        )
+                        if "System role not supported" in error_msg:
+                            logger.warning(
+                                f"Detected System role limitation on backend {determined_tag} in non-streaming call. Retrying with flattened payload..."
+                            )
+                            UNSUPPORTED_SYSTEM_ROLE_MODELS.add(determined_tag)
+                            persist_shared_state()
+                            retry_payload["messages"] = flatten_system_message(
+                                payload["messages"]
+                            )
+                        if "maximum context length" in error_msg.lower():
+                            retry_payload["max_tokens"] = 256
 
                         retry_response = await client.post(
                             target_url, json=retry_payload, headers=headers
