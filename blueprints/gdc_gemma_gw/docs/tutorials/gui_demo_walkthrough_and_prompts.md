@@ -70,11 +70,15 @@ EOF
   - **Active Framework Badge:** Shows **`OLLAMA`** (or **`VLLM`** after the Step 6 engine flip) and **`Status: ONLINE`**.
   - **Live Gauges:** `CPU Load (%)`, `GPU Core Load (%)`, `Tokens Out/Sec`, `Active DB Pools`, and the **`VRAM Consumption`** progress bar updating every 2 seconds directly from the live inference pods.
 
-### Step 1.3: Test Card 2 — `🎛️ Gateway Parameters Override`
-1. **Action:** Change **`Sampling Temperature`** from `0.7` to `0.4`, keep **`Model Variant Hot-Swap`** on **`Gemma 4 26B A4B (MoE) — Fast Tier 1`**, and click **`Save Gateway Configuration`**.
-2. **Expected Result:**
-   - A green confirmation toast appears (`Gateway configuration updated successfully`).
-   - Change **`Sampling Temperature`** back to `0.7` and click **`Save Gateway Configuration`**.
+### Step 1.3: Test Card 2 — `🎛️ Gateway Parameters Override` (True Gateway-Enforced Overrides)
+1. **How It Works:** Any parameter saved in Card 2 (`Sampling Temperature`, `Top-P`, `Max Vision Tokens`, and `Model Variant Hot-Swap`) is persisted to `/tmp/gemma_gateway_state.json` across all Gateway workers and **unconditionally overrides** downstream client parameters on `/v1/chat/completions` (echoing the enforced values in `X-Gemma-Temperature`, `X-Gemma-Top-P`, and `X-Gemma-Vision-Budget` response headers).
+2. **Action:**
+   - Change **`Sampling Temperature`** from `0.7` to `0.2` and switch **`Model Variant Hot-Swap`** to **`Gemma 4 31B (Dense) — Deep Reasoning Tier 2`**, then click **`Save Gateway Configuration`**.
+   - Open **Port `8081` (`Tactical Chat`)** with the model dropdown set to **`Gemma 4 Gateway (Auto)`** and send a simple conversational query: `Hello, confirm system status.`
+3. **Expected Result:**
+   - On Port `8080`, a green confirmation toast appears (`Gateway configuration updated successfully`).
+   - On Port `8081`, even though the prompt is simple conversational text, the navbar routing badge displays **`→ gemma4:31b`** and generation uses `temperature=0.2`.
+   - Return to **Port `8080`**, restore **`Model Variant Hot-Swap`** to **`Gemma 4 26B A4B (MoE) — Fast Tier 1`** and **`Sampling Temperature`** to `0.7`, and click **`Save Gateway Configuration`**.
 
 ---
 

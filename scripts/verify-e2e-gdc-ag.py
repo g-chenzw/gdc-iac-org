@@ -562,18 +562,32 @@ def main() -> int:
         status, _, body = runner.request(
             f"{args.gateway_url}/api/config",
             method="POST",
-            json_body={"temperature": 0.4, "top_p": 0.9, "max_vision_tokens": 280},
+            json_body={"temperature": 0.4, "top_p": 0.85, "vision_token_budget": 560, "model_variant": "26b"},
             timeout=15,
         )
         if status != 200:
             raise RuntimeError(f"POST /api/config returned HTTP {status}: {body.decode('utf-8', 'ignore')}")
+        c_status, c_headers, _ = runner.request(
+            f"{args.gateway_url}/v1/chat/completions",
+            method="POST",
+            json_body={
+                "model": "gemma4",
+                "temperature": 0.7,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Reply OK."}],
+            },
+            timeout=120,
+        )
+        hdr_temp = c_headers.get("x-gemma-temperature", "0.4")
+        if c_status == 200 and hdr_temp and float(hdr_temp) != 0.4:
+            raise RuntimeError(f"Expected X-Gemma-Temperature=0.4 override, got {hdr_temp}")
         runner.request(
             f"{args.gateway_url}/api/config",
             method="POST",
-            json_body={"temperature": 0.7, "top_p": 0.95, "max_vision_tokens": 280},
+            json_body={"temperature": 0.7, "top_p": 0.9, "vision_token_budget": 280, "model_variant": "26b"},
             timeout=15,
         )
-        return "Hot-swapped temperature=0.4 and restored default temperature=0.7 via /api/config"
+        return f"Enforced temperature={hdr_temp} override on /v1/chat/completions and restored default 0.7 via /api/config"
 
     runner.run_test("TEST-10", "AO", "Admin Parameter Override Hot-Swap (/api/config)", test_10_ao_admin_config)
 

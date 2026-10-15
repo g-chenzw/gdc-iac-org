@@ -119,9 +119,8 @@ async def generate_chat_response(
 
         response = await asyncio.to_thread(
             client.chat.completions.create,
-            model=model_name or "gemma4:26b",
+            model=model_name or "gemma4",
             messages=openai_history,
-            temperature=0.7,
             max_tokens=MAX_CHAT_TOKENS,
             stream=False,
             extra_headers=extra_headers,

@@ -849,6 +849,7 @@ class UpdateConfigRequest(BaseModel):
     top_p: float = None
     frequency_penalty: float = None
     vision_token_budget: int = None
+    max_vision_tokens: int = None
     model_variant: str = None
 
 
@@ -1648,6 +1649,8 @@ async def update_config(
         CURRENT_STATE["frequency_penalty"] = config.frequency_penalty
     if config.vision_token_budget is not None:
         CURRENT_STATE["vision_token_budget"] = config.vision_token_budget
+    elif config.max_vision_tokens is not None:
+        CURRENT_STATE["vision_token_budget"] = config.max_vision_tokens
     if config.model_variant is not None:
         CURRENT_STATE["model_variant"] = config.model_variant
     persist_shared_state()
@@ -1865,13 +1868,10 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
 
     payload = await request.json()
 
-    # Inject system-wide generation parameters if not specified in request
-    if "temperature" not in payload:
-        payload["temperature"] = CURRENT_STATE["temperature"]
-    if "top_p" not in payload:
-        payload["top_p"] = CURRENT_STATE["top_p"]
-    if "frequency_penalty" not in payload:
-        payload["frequency_penalty"] = CURRENT_STATE["frequency_penalty"]
+    # Enforce Gateway Control Plane generation parameters (Port 8080 /api/config overrides)
+    payload["temperature"] = CURRENT_STATE["temperature"]
+    payload["top_p"] = CURRENT_STATE["top_p"]
+    payload["frequency_penalty"] = CURRENT_STATE["frequency_penalty"]
 
     # Determine target URL based on requested model and dynamic classification
     requested_model = payload.get("model", "default")
@@ -1920,6 +1920,9 @@ async def chat_completions(request: Request, _auth: None = Depends(verify_api_au
     response_headers = {
         "X-Model-Used": determined_tag,
         "X-Model-Tier": "Dense" if "31b" in determined_tag else "MoE",
+        "X-Gemma-Temperature": str(CURRENT_STATE["temperature"]),
+        "X-Gemma-Top-P": str(CURRENT_STATE["top_p"]),
+        "X-Gemma-Vision-Budget": str(CURRENT_STATE["vision_token_budget"]),
     }
 
     # Downstream LLM generation timeout. Allow up to 300 seconds for slow/split-model staging servers.

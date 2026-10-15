@@ -283,11 +283,14 @@
             <div class="form-group">
                 <label>Model Variant Hot-Swap</label>
                 <select id="model_variant">
-                    <option value="26b" {% if state.model_variant == '26b' %}selected{% endif %}>Gemma 4 26B A4B (MoE)</option>
-                    <option value="31b" {% if state.model_variant == '31b' %}selected{% endif %}>Gemma 4 31B (Dense)</option>
+                    <option value="26b" {% if state.model_variant == '26b' %}selected{% endif %}>Auto: Gemma 4 26B MoE (Tier 1) → 31B Dense (Tier 2)</option>
+                    <option value="31b" {% if state.model_variant == '31b' %}selected{% endif %}>Override All: Gemma 4 31B (Dense)</option>
                 </select>
             </div>
-            <button class="btn" onclick="saveConfiguration()">Save Gateway Configuration</button>
+            <div style="display: flex; gap: 10px;">
+                <button class="btn" style="flex: 1;" onclick="saveConfiguration()">Save Gateway Configuration</button>
+                <button class="btn" style="flex: 0 0 auto; width: auto; background: #1e293b; border: 1px solid #334155;" onclick="resetToDefaults()" title="Reset Temperature (0.7), Top-P (0.9), Vision Budget (280), and Routing (Auto 26B → 31B)">↺ Reset to Auto</button>
+            </div>
         </div>
 
         <!-- 🕵️ Session Oversight & Kill-Switch -->
@@ -818,6 +821,16 @@
         } catch (error) {
             showBanner("❌ Network error updating parameters.", true);
         }
+    }
+
+    async function resetToDefaults() {
+        document.getElementById('temperature').value = 0.7;
+        document.getElementById('temp-val').innerText = '0.7';
+        document.getElementById('top_p').value = 0.9;
+        document.getElementById('top-p-val').innerText = '0.9';
+        document.getElementById('vision_token_budget').value = '280';
+        document.getElementById('model_variant').value = '26b';
+        await saveConfiguration();
     }
 
     async function quickOidcSignIn(username, role) {
