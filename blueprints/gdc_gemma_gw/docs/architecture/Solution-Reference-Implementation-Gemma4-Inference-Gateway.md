@@ -65,7 +65,7 @@ Ensure the following prerequisites are met:
 * User cluster created with GPU-enabled node pools and sufficient GPU memory.
 * Minimum of 1 NVIDIA A100 (80GB) GPU for the 26B MoE model; minimum of 2 NVIDIA A100 (80GB) GPUs for the 31B Dense model.
 * Harbor container registry instance available and accessible.
-* All required container images (vLLM serving, NGINX sidecar, Gateway proxy) packaged and sideloaded into your local GDC-ag registry. See **[Air-Gapped Packaging & Sideloading Guide](sideloading-guide.md)** for detailed export/import steps.
+* All required container images (vLLM serving, NGINX sidecar, Gateway proxy) packaged and sideloaded into your local GDC-ag registry. See **[Air-Gapped Packaging & Sideloading Guide](../operations/sideloading-guide.md)** for detailed export/import steps.
 * `kubectl` and `gdcloud` CLIs configured to access the user cluster.
 * Docker client installed and configured on the workstation to push to Harbor.
 * Necessary IAM permissions granted (e.g., Namespace Admin, Cluster Developer).

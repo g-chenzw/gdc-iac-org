@@ -6,7 +6,7 @@ This guide details how to provision and scale the **Gemma 4 unquantized** models
 
 > [!NOTE]
 > **Sideloading Cross-Reference:**
-> For complete instructions on packaging, bundling, and transferring container images and manifests across the secure air-gap perimeter, refer to the [Air-Gapped Packaging & Sideloading Guide](sideloading-guide.md).
+> For complete instructions on packaging, bundling, and transferring container images and manifests across the secure air-gap perimeter, refer to the [Air-Gapped Packaging & Sideloading Guide](./sideloading-guide.md).
 
 ---
 
@@ -16,7 +16,7 @@ Deploying the full **Gemma 4 Dedicated Inference Gateway** stack in production G
 
 > [!TIP]
 > **GCP Staging & Sandbox Emulation Note:**
-> If you are testing or validating this entire serving setup inside a GCP GKE development sandbox rather than a live air-gapped GDC production rack, refer to the **[GCP Quickstart Guide](quickstart_on_GCP.md)**. The guide contains the exact commands to provision the GKE GPU cluster, configure symmetrical node labels (`app=vllm-26b`, `app=vllm-31b`, `app=client`), and deploy PostgreSQL database emulation (`statefulset-postgres.yaml`).
+> If you are testing or validating this entire serving setup inside a GCP GKE development sandbox rather than a live air-gapped GDC production rack, refer to the **[GCP Quickstart Guide](../tutorials/quickstart_on_GCP.md)**. The guide contains the exact commands to provision the GKE GPU cluster, configure symmetrical node labels (`app=vllm-26b`, `app=vllm-31b`, `app=client`), and deploy PostgreSQL database emulation (`statefulset-postgres.yaml`).
 
 ### 1. Target GDC Shared Platform/System Cluster
 * **Why?** GPU hardware cores (NVIDIA H100/A100) are the most restricted resource inside air-gapped environments. Deploying dynamic model engines inside individual Tenant/User clusters strands valuable GPU memory and causes cold-starts.
@@ -213,7 +213,7 @@ In GDC air-gapped cluster racks, unquantized model weights must be sideloaded in
 
 ### 3.1. Sideloading weights into your Disconnected PV Staging Directory
 
-Execute these steps to download and bundle **both** unquantized Gemma 4 variants on your internet-connected bastion before shipping them over the air-gap perimeter (as detailed in the [Sideloading Guide](sideloading-guide.md#25-packaging-gated-model-weights-moe-26b-dense-31b-multimodal-8b)):
+Execute these steps to download and bundle **both** unquantized Gemma 4 variants on your internet-connected bastion before shipping them over the air-gap perimeter (as detailed in the [Sideloading Guide](./sideloading-guide.md#25-packaging-gated-model-weights-moe-26b-dense-31b-multimodal-8b)):
 
 ```bash
 # 1. Authenticate against Hugging Face Hub
@@ -495,7 +495,7 @@ In production air-gapped environments, cross-project gateway access must be cryp
 
 *   **Keycloak Integration**: To secure user sessions, transition client applications from "Mock User" modes to federated OpenID Connect (OIDC) authentication using Keycloak running natively on GDC.
 *   **Architecture & Claims Validation**: The client frontend triggers the OIDC Authorization Code Flow (with PKCE) directly against Keycloak, obtaining a JWT (Access Token) which is dynamically attached as an `Authorization: Bearer <JWT>` header to downstream requests. The FastAPI backend cryptographically validates this signature using the Keycloak certificates (`/certs`).
-*   **Detailed Implementation Guide**: Refer to the complete, step-by-step [Keycloak Integration Guide](keycloak_integration_guide.md) for instructions on provisioning Keycloak Realms, configuring clients (`rag-frontend`), updating Axios token interceptors in React, and building robust OIDC validation middleware in python/FastAPI.
+*   **Detailed Implementation Guide**: Refer to the complete, step-by-step [Keycloak Integration Guide](./keycloak_integration_guide.md) for instructions on provisioning Keycloak Realms, configuring clients (`rag-frontend`), updating Axios token interceptors in React, and building robust OIDC validation middleware in python/FastAPI.
 
 ---
 
@@ -503,7 +503,7 @@ In production air-gapped environments, cross-project gateway access must be cryp
 
 When scaling `vllm-26b` or `vllm-31b` beyond a single GPU pod (`replicaCount > 1`) to serve Medium (3,000 RPM) or Large (6,000 RPM) enterprise workloads, standard Kubernetes `Service` round-robin load balancing can cause KV-cache hotspots and prefix-cache misses across replicas.
 
-This repository packages an optional **Envoy `InferencePool` + `epp` Endpoint Picker** Helm chart in [`blueprints/envoy-inference-pool`](../blueprints/envoy-inference-pool/README.md) that integrates directly with `gemma-gateway` and `blueprints/vllm-gke`:
+This repository packages an optional **Envoy `InferencePool` + `epp` Endpoint Picker** Helm chart in [`blueprints/envoy-inference-pool`](../README.md) that integrates directly with `gemma-gateway` and `blueprints/vllm-gke`:
 
 1. **Pod Label Integration (`blueprints/vllm-gke`)**:
    All `vllm-gke` pods automatically carry `inference.networking.k8s.io/engine-type: vllm`, `app.kubernetes.io/name: vllm-gke`, and `app.kubernetes.io/instance: <release-name>` (`vllm-26b` or `vllm-31b`).

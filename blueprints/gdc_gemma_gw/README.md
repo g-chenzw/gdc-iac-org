@@ -6,30 +6,34 @@ This repository contains the infrastructure and code for running a secure, high-
 
 ---
 
-## 📖 Documentation Reading Trails
+## 📖 Documentation Hub & Reading Trails
 
-To navigate this repository smoothly, follow the designated path of guides depending on your operational target:
+All documentation is consolidated in the **[`docs/` Documentation Hub](docs/README.md)**, organized into four subfolders:
+- **[`docs/tutorials/`](docs/README.md#1-tutorials--interactive-walkthroughs-docstutorials)**: Step-by-step end-to-end deployment guides, interactive GUI walkthroughs, and automated verification runbooks.
+- **[`docs/architecture/`](docs/README.md#2-architecture--design-references-docsarchitecture)**: Reference architectures, prompt complexity routing design, GPU/VRAM T-shirt sizing, and security hardening.
+- **[`docs/operations/`](docs/README.md#3-operations-packaging--troubleshooting-docsoperations)**: Air-gapped OCI/weight sideloading, production vLLM + Envoy `InferencePool` serving, Keycloak OIDC federation, Day-2 administration, and troubleshooting.
+- **[`docs/testing/`](docs/README.md#4-testing--quality-assurance-docstesting)**: Automated unit/integration/load testing (`pytest` & `Locust`), GDC air-gapped smoke tests, and Keycloak sandbox strategies.
 
-### Pathway 1: Testing and Developing on GCP (Sandbox Emulation)
-If you are a developer validating features, testing prompt classifiers, or building application integrations inside GKE standard/sandbox environments:
-1. 📂 **[GCP Quickstart Guide](docs/quickstart_on_GCP.md)**: Read first to provision dynamic GKE GPU node pools, compile local containers, and deploy the Ollama sandboxes or vLLM mock serving releases.
-2. 🔐 **[Keycloak OIDC Staging Strategy](docs/gcp-sandbox-keycloak-testing-strategy.md)**: Master blueprint detailing browser preview sandbox cookie bypass, single-port NGINX proxy overlays, and zero-dependency PKCE auth engines.
-3. 🎯 **[AI-Enabled Blueprint E2E Deployment & Verification Guide (GDC-ag Production IaC)](docs/tutorials/ai_enabled_e2e_gdc_production_iac_guide.md)**: Full multi-stage `gdc-iac-org` Helmfile runbook deploying the Gemma 4 Gateway, Envoy `InferencePool`, Joint Intelligence E2E Console, and `p13-gdc-dev` Developer Platform on GDC-ag.
-4. 🧪 **[Automated Testing & QA Guide](docs/automated-testing-guide.md)**: Learn how to run local mock backend test fixtures, execute the complete Pytest unit/integration matrix, and track streaming metrics in Locust.
-5. 🧠 **[FAQ & Operational Troubleshooting](docs/faq-troubleshooting.md)**: Refer to this guide during development to resolve Workstation proxy connection conflicts, dynamic storage claims, regional GPU exhaustion stock traps, and aggressive browser refreshes.
+### Pathway 1: Testing and Developing on GCP (Staging Emulation)
+If you are a developer validating features, testing prompt classifiers, or running the full AI-enabled blueprint stack on GKE:
+1. 🎯 **[AI-Enabled Blueprint E2E Deployment Guide (GCP Staging)](docs/tutorials/ai_enabled_e2e_gcp_staging_guide.md)**: Complete end-to-end runbook deploying the Gemma Gateway (`8080`), Joint Intelligence & Chat Client (`8081`/`8082`), Kafka (`P4`), RAG (`P6`), SQL Analyst (`P7`), Keycloak (`P12`), and `gdc-dev` (`8083`/`8084`).
+2. 🖥️ **[GUI Functional Walkthrough & Live Demo Playbook](docs/tutorials/gui_demo_walkthrough_and_prompts.md)**: Interactive browser walkthrough across all 5 ports (`8080`–`8084`) with copy-pasteable prompts to trigger `26B MoE` vs. `31B Dense` routing, RAG citations, Text-to-SQL, and `gdc-dev` IDE Swarm.
+3. ✅ **[Zero-Tweak Automated E2E & IO/AO Verification Suite](docs/tutorials/e2e_zero_tweak_validation_runbook.md)**: Automated 17-check (`verify-e2e-gcp-staging.py`) and 20-check (`verify-e2e-gdc-ag.py`) CLI verification suites.
+4. 📂 **[Standalone Gateway & Client GCP Quickstart](docs/tutorials/quickstart_on_GCP.md)**: Focused quickstart for provisioning GKE GPU node pools and deploying only the standalone Gateway and Chat Client.
+5. 🔐 **[Keycloak OIDC Staging Strategy](docs/testing/gcp-sandbox-keycloak-testing-strategy.md)** & 🧪 **[Automated Testing & QA Guide](docs/testing/automated-testing-guide.md)**.
+6. 🧠 **[FAQ & Operational Troubleshooting](docs/operations/faq-troubleshooting.md)**: Solutions for Cloud Workstation proxy cookies, dynamic storage claims, and regional GPU stock exhaustion.
 
 ---
 
 ### Pathway 2: Preparing and Deploying to GDC Air-Gapped (Production Target)
-If you are a platform operator packaging cluster assets or deploying to disconnected GDC air-gapped production rack locations:
-1. 📂 **[Gemma 4 Dedicated Inference Gateway Reference Manual](docs/Solution-Reference-Implementation-Gemma4-Inference-Gateway.md)**: Master blueprint detailing architecture, proxy classifier setup, serving engine pools (vLLM/Ollama), and HTTPRoute configuration on GDC-ag user clusters.
-2. 📂 **[Gemma 4 Client Application Reference Manual](docs/Solution-Reference-Implementation-Gemma4-Client-Application.md)**: Master blueprint for deploying the three-tier client web application, whitelisting cross-namespace ingress, database and object storage integration, and configuring native Keycloak OIDC.
-3. 🎯 **[End-to-End Tutorial: Multi-Blueprint Intelligence Synthesis (GDC-ag Production)](docs/tutorials/e2e_intelligence_synthesis_gdc_production.md)**: Complete production runbook for packaging, sideloading to internal Harbor, provisioning GDC Managed PostgreSQL (`DBCluster`) & SAN (`standard-rwx`), and exposing services via Kubernetes Gateway API (`HTTPRoute`) or GDC Internal Load Balancer `Ingress`.
-4. 📦 **[Air-Gapped Packaging & Sideloading Guide](docs/sideloading-guide.md)**: Read first to package container image archives, stage gated Hugging Face model weights, and ingest assets into dynamic internal Harbor registries offline.
-5. 🔐 **[Keycloak OIDC Integration Guide](docs/keycloak_integration_guide.md)**: Master integration guide on establishing Keycloak boundaries, locking down Web Origins, deploying GDC standard Gateway API HTTPRoute resources, and optimizing internal KubeDNS resolution.
-6. 💾 **[GDC Production Serving Guide: vLLM & Gemma 4](docs/vllm-serving-guide.md)**: Read to dynamically provision PersistentVolumeClaims via temporary helper staging pods, mount unquantized weights, and configure concurrent dual-model serving under SAN constraints.
-7. 🔌 **[GDC Air-Gapped Testing Methodology](docs/testing-methodology.md)**: Follow these terminal-only commands to launch isolated test pods in the cluster and verify completions directly over internal GKE DNS.
-8. 🧠 **[FAQ & Operational Troubleshooting](docs/faq-troubleshooting.md)**: Refer to this guide to clear PVC finalizer deadlocks, provision HF secrets, and establish selector-instance affinity to prevent round-robin cross-talk.
+If you are an Infrastructure Operator (IO) or Application Operator (AO) packaging cluster assets or deploying to disconnected GDC air-gapped production racks:
+1. 🎯 **[AI-Enabled Blueprint E2E Deployment Guide (GDC-ag Production IaC)](docs/tutorials/ai_enabled_e2e_gdc_production_iac_guide.md)**: Declarative multi-stage `gdc-iac-org` Helmfile (`0-bootstrap` $\rightarrow$ `5-workload-factory`) production deployment and IO/AO upgrade verification.
+2. 📂 **[Gemma 4 Dedicated Inference Gateway Reference Manual](docs/architecture/Solution-Reference-Implementation-Gemma4-Inference-Gateway.md)**: Master blueprint detailing architecture, proxy classifier setup, serving engine pools (vLLM/Ollama), and `HTTPRoute` configuration on GDC-ag clusters.
+3. 📂 **[Gemma 4 Client Application Reference Manual](docs/architecture/Solution-Reference-Implementation-Gemma4-Client-Application.md)**: Master blueprint for deploying the three-tier client web application, whitelisting cross-namespace ingress, database and object storage integration, and configuring native Keycloak OIDC.
+4. 📦 **[Air-Gapped Packaging & Sideloading Guide](docs/operations/sideloading-guide.md)**: Package container image archives, stage gated Hugging Face model weights, and ingest assets into GDC Managed Harbor offline.
+5. 🔐 **[Keycloak OIDC Integration Guide](docs/operations/keycloak_integration_guide.md)**: Establish Keycloak boundaries, lock down Web Origins, deploy GDC standard Gateway API `HTTPRoute` resources, and optimize internal KubeDNS resolution.
+6. 💾 **[GDC Production Serving Guide: vLLM & Gemma 4](docs/operations/vllm-serving-guide.md)**: Dynamically provision `standard-rwx` PersistentVolumeClaims, mount unquantized weights, and configure concurrent dual-model vLLM serving with Envoy `InferencePool` (`epp`).
+7. 🔌 **[GDC Air-Gapped Testing Methodology](docs/testing/testing-methodology.md)** & 🧠 **[FAQ & Operational Troubleshooting](docs/operations/faq-troubleshooting.md)**.
 
 ---
 
@@ -101,11 +105,11 @@ pip install -r requirements.txt
 python chat_sample.py
 ```
 
-For complete, step-by-step instructions on automated and manual testing across local development and GKE workstation environments, see the [Automated Testing & Quality Assurance Guide](docs/automated-testing-guide.md) and the [GDC Testing Methodology](docs/testing-methodology.md).
+For complete, step-by-step instructions on automated and manual testing across local development and GKE workstation environments, see the [Automated Testing & Quality Assurance Guide](docs/testing/automated-testing-guide.md) and the [GDC Testing Methodology](docs/testing/testing-methodology.md).
 
 ### Troubleshooting & FAQ
 
-A dedicated, highly detailed operational manual is available in the [FAQ & Operational Troubleshooting Guide](docs/faq-troubleshooting.md). This guide details:
+A dedicated, highly detailed operational manual is available in the [FAQ & Operational Troubleshooting Guide](docs/operations/faq-troubleshooting.md). This guide details:
 - Differences between GCP GKE emulation environments and physical air-gapped GDC production racks.
 - End-to-end dynamic model hot-swapping validation procedures across proxy payloads, serving logs, and client badge sync.
 - Infrastructure blockers (CORS proxy failures, gated repos, immutable selector deadlocks, aggressive caching).
@@ -178,7 +182,7 @@ The tables below outline the GDC cluster resource requirements to support varyin
 
 > [!TIP]
 > **ARCHITECTURAL COMPLIANCE REPORT:**
-> The entire sizing matrix has been physically audited, verified, and signed off under detailed mathematical token flow derivations, VRAM KV cache pools calculations, and GDC-ag standard machine mappings! Proceed deeply into the master engineering report: **[docs/resource-sizing-validation.md](docs/resource-sizing-validation.md)**.
+> The entire sizing matrix has been physically audited, verified, and signed off under detailed mathematical token flow derivations, VRAM KV cache pools calculations, and GDC-ag standard machine mappings! Proceed deeply into the master engineering report: **[docs/architecture/resource-sizing-validation.md](docs/architecture/resource-sizing-validation.md)**.
 
 Our resource t-shirt sizing recommendations are formulated using dynamic token throughput calculations, standard GDC-ag architecture benchmarks, and three core engineering pillars:
 
@@ -247,7 +251,7 @@ Using `./scripts/clean-single-local-image.sh` or `./scripts/clean-specific-image
 
 ## 5. Air-Gapped Packaging and Deployment (GDC-ag)
 
-For instructions on how to build, package, and securely transfer the deployment assets to GDC production environments, refer to the [Air-Gapped Packaging & Sideloading Guide](docs/sideloading-guide.md).
+For instructions on how to build, package, and securely transfer the deployment assets to GDC production environments, refer to the [Air-Gapped Packaging & Sideloading Guide](docs/operations/sideloading-guide.md).
 
 ### Target Variables Configuration
 Ensure you have configured the appropriate target destination variables before starting the pipeline:
@@ -274,7 +278,7 @@ Located in the `gemma-client/` directory, this client serves as the user-facing 
 - **Workload Identity Auth & Storage Emulation**: Interrogates the isolated database and storage service accounts, simulating production-grade air-gapped cloud resource provisioning exactly as mapped in `../GDC-blueprints/`.
 
 ### Air-Gapped Verification
-Refer to the [GDC Testing Methodology](docs/testing-methodology.md) for complete, terminal-only, disconnected test instructions using ephemeral test pods inside the cluster.
+Refer to the [GDC Testing Methodology](docs/testing/testing-methodology.md) for complete, terminal-only, disconnected test instructions using ephemeral test pods inside the cluster.
 
 ---
 

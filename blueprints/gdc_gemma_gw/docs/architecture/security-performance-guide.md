@@ -57,8 +57,8 @@ The security posture has been hardened under a strictly modular, feature-flagged
     To avoid manual operator interactions and align with GDC physical rack GitOps standards, Keycloak's target realm boundary, dynamic client whitelists, and user accounts (`alice`/`charlie`) are preloaded inside a GKE ConfigMap volume. Keycloak imports this config dynamically in 6 seconds on startup, **completely bypassing the locked admin console Spinner loops!**
 
 Refer to the staged strategy guides and playbooks to review this dynamic perimeter:
-*   🔑 **[gcp-sandbox-keycloak-testing-strategy.md](file:///Users/gmollison/GitHub/gdc_gemma_gw/docs/gcp-sandbox-keycloak-testing-strategy.md)**: Staging topologies, Nginx single-port mappings, and physical rack Gateway API routes.
-*   🔑 **[keycloak_integration_guide.md](file:///Users/gmollison/GitHub/gdc_gemma_gw/docs/keycloak_integration_guide.md)**: Master standard OIDC integration blueprint detailing GDC-ag standard Gateway API HTTPRoute manifests.
+*   🔑 **[gcp-sandbox-keycloak-testing-strategy.md](../testing/gcp-sandbox-keycloak-testing-strategy.md)**: Staging topologies, Nginx single-port mappings, and physical rack Gateway API routes.
+*   🔑 **[keycloak_integration_guide.md](../operations/keycloak_integration_guide.md)**: Master standard OIDC integration blueprint detailing GDC-ag standard Gateway API HTTPRoute manifests.
 *   🔧 **[configure-keycloak.sh](file:///Users/gmollison/GitHub/gdc_gemma_gw/gemma-client/scripts/configure-keycloak.sh)**: Dynamic configuration script to automatically hydrate GKE manifests and write Vite frontend environments without hardcoded settings.
 
 ---
@@ -703,7 +703,7 @@ async def health():
 
 ## References
 
-- [Keycloak Integration Guide](./keycloak_integration_guide.md)
-- [vLLM Serving Guide](./vllm-serving-guide.md)
-- [Testing Methodology](./testing-methodology.md)
-- [Quickstart on GCP](./quickstart_on_GCP.md)
+- [Keycloak Integration Guide](../operations/keycloak_integration_guide.md)
+- [vLLM Serving Guide](../operations/vllm-serving-guide.md)
+- [Testing Methodology](../testing/testing-methodology.md)
+- [Quickstart on GCP](../tutorials/quickstart_on_GCP.md)

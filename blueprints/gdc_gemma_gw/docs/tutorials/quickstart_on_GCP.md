@@ -281,7 +281,7 @@ Administrators can select between two pathways depending on GKE cluster rig GPU 
 
 ##### Option A: Full-Scale Simultaneous Dual-Model Serving (Requires Multi-GPU A100/H100 or Sideloaded Weights)
 
-If you have already downloaded `gemma-4-26B-A4B-it-weights.tar.gz` and `gemma-4-31B-it-weights.tar.gz` from Hugging Face onto your Cloud Workstation, see **[vLLM Serving Guide — Section 3.2](vllm-serving-guide.md#32-bootstrapping-storage--extracting-weights-inside-gdc-ag)** (or **Step 5.1 Option A2** below) to sideload those archives directly into GKE `standard-rwo` PersistentVolumeClaims without re-downloading from Hugging Face.
+If you have already downloaded `gemma-4-26B-A4B-it-weights.tar.gz` and `gemma-4-31B-it-weights.tar.gz` from Hugging Face onto your Cloud Workstation, see **[vLLM Serving Guide — Section 3.2](../operations/vllm-serving-guide.md#32-bootstrapping-storage--extracting-weights-inside-gdc-ag)** (or **Step 5.1 Option A2** below) to sideload those archives directly into GKE `standard-rwo` PersistentVolumeClaims without re-downloading from Hugging Face.
 
 > [!WARNING]
 > **VRAM Hardware Constraint on `g2-standard-24` (2x 24GB L4 GPUs):**  

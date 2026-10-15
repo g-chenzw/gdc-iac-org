@@ -1,7 +1,10 @@
 # GUI Functional Walkthrough & Live Demo Playbook (Ports `8080`–`8084` & GDC-ag FQDNs)
 
 > **Document ID:** `PLAYBOOK-GUI-DEMO-AND-WALKTHROUGH`  
-> **Companion Guide:** [AI-Enabled Blueprint E2E Deployment & Verification Guide (GDC-ag Production IaC)](./ai_enabled_e2e_gdc_production_iac_guide.md)
+> **Companion Guides:**  
+> - [Zero-Tweak E2E Validation Runbook & Upgrade Suite](./e2e_zero_tweak_validation_runbook.md)  
+> - [AI-Enabled Blueprint E2E Test Guide (GCP Staging & Development)](./ai_enabled_e2e_gcp_staging_guide.md)  
+> - [AI-Enabled Blueprint E2E Deployment & Verification Guide (GDC-ag Production IaC)](./ai_enabled_e2e_gdc_production_iac_guide.md)
 
 ---
 
@@ -23,7 +26,7 @@ This playbook serves both as a **step-by-step manual QA checklist** for validati
 
 ## 2. Pre-Demo Preparation: Generate a Sample Tactical Document for Upload (`10 Seconds`)
 
-Before starting Scene 3 (the Document Upload & RAG demo on `intel.gdc.local` / Port `8081`), create a local text file named `Operation_Vanguard_Shield_Directive.txt` on your laptop (or download it from your workstation) containing specific facts that are **not** in the model's pre-training data:
+Before starting Scene 3 (the Document Upload & RAG demo on Port `8081`/`8082`), create a local text file named `Operation_Vanguard_Shield_Directive.txt` on your laptop (or download it from your workstation) containing specific facts that are **not** in the model's pre-training data:
 
 ```bash
 cat << 'EOF' > ~/Operation_Vanguard_Shield_Directive.txt
@@ -62,7 +65,7 @@ EOF
 
 ### Step 1.2: Inspect Card 1 — `⚡ Live System Performance & Telemetry`
 - **What to Observe:**
-  - **Active Framework Badge:** Shows **`VLLM`** (or **`OLLAMA`**) and **`Status: ONLINE`**.
+  - **Active Framework Badge:** Shows **`OLLAMA`** (or **`VLLM`** after the Step 6 engine flip) and **`Status: ONLINE`**.
   - **Live Gauges:** `CPU Load (%)`, `GPU Core Load (%)`, `Tokens Out/Sec`, `Active DB Pools`, and the **`VRAM Consumption`** progress bar updating every 2 seconds directly from the live inference pods.
 
 ### Step 1.3: Test Card 2 — `🎛️ Gateway Parameters Override`
@@ -167,7 +170,7 @@ EOF
 1. In the top navigation bar on **Port `8081`** (or `8082`), click **`💬 Gemma Client`** (next to `🛡️ Intel Console`).
 2. **What to Observe:** The UI switches immediately to the **Standard Gemma Workspace Client** (left sidebar with **Conversations** and **Uploaded Files**, main multi-turn chat canvas, and the **`Use provided sources`** checkbox in the bottom input bar).
 
-### Step 3.1: Upload a Document to Object Storage (`s3://gemma-rag-bucket` or `gs://gemma-client-files-${PROJECT_ID}`)
+### Step 3.1: Upload a Document to Cloud / Object Storage (`gs://gemma-client-files-${PROJECT_ID}` or `s3://gemma-rag-bucket`)
 1. In the left sidebar under **Files**, click **`Upload File`** and select `~/Operation_Vanguard_Shield_Directive.txt` (created in Section 2 above).
 2. **Expected Result:**
    - The upload completes (`HTTP 200`) and `Operation_Vanguard_Shield_Directive.txt` appears in the **Files** list in the left sidebar.

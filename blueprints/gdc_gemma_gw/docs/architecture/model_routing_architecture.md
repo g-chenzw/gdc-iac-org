@@ -227,7 +227,7 @@ MODEL_ROUTING_CONFIG = json.loads(os.getenv("MODEL_ROUTING_CONFIG", DEFAULT_ROUT
 
 When `vllm-26b` or `vllm-31b` is scaled horizontally across multiple GPU replicas (`replicaCount > 1`), standard Kubernetes `ClusterIP` round-robin load balancing is blind to per-pod KV-cache saturation and prefix-cache state.
 
-By deploying the optional [`blueprints/envoy-inference-pool`](../blueprints/envoy-inference-pool/README.md) chart and setting `apps.envoyInferencePool.enabled: true` on `gemma-gateway`, the gateway inserts an **Envoy AI Gateway + Gateway API Inference Extension (`InferencePool` + `epp` Endpoint Picker)** tier between `gemma-gateway` and the `vllm-26b` / `vllm-31b` pods:
+By deploying the optional [`blueprints/envoy-inference-pool`](../README.md) chart and setting `apps.envoyInferencePool.enabled: true` on `gemma-gateway`, the gateway inserts an **Envoy AI Gateway + Gateway API Inference Extension (`InferencePool` + `epp` Endpoint Picker)** tier between `gemma-gateway` and the `vllm-26b` / `vllm-31b` pods:
 
 1. **Header Propagation (`gateway/proxy/main.py`)**:
    After authenticating the user via Keycloak OIDC and classifying the prompt (`gemma4:26b` vs `gemma4:31b`), `gemma-gateway` injects two downstream headers on every upstream request:

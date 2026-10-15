@@ -48,7 +48,7 @@ Ensure the following prerequisites are met:
 * GDC Object Storage Bucket pre-created.
 * GDC user cluster and Kubeconfig settings configured on your workstation.
 * Harbor container registry instance available and accessible.
-* All required container images (client frontend, backend, Keycloak, NGINX sidecar) packaged and sideloaded into your local GDC-ag registry. See **[Air-Gapped Packaging & Sideloading Guide](sideloading-guide.md)** for detailed export/import steps.
+* All required container images (client frontend, backend, Keycloak, NGINX sidecar) packaged and sideloaded into your local GDC-ag registry. See **[Air-Gapped Packaging & Sideloading Guide](../operations/sideloading-guide.md)** for detailed export/import steps.
 * `kubectl` and `gdcloud` CLIs configured to access the user cluster.
 
 # Section 1: Common Setup

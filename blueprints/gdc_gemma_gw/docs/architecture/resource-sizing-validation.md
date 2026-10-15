@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-This report delivers a rigorous, multi-dimensional mathematical and hardware-level validation of the **T-Shirt Sizing resource requirements** outlined in the master repository [README.md](file:///Users/gmollison/GitHub/gdc_gemma_gw/README.md#L112-L172) (Inference Gateway Servers) and [gemma-client/README.md](file:///Users/gmollison/GitHub/gdc_gemma_gw/gemma-client/README.md#L46-L73) (Multi-User Chat Application). 
+This report delivers a rigorous, multi-dimensional mathematical and hardware-level validation of the **T-Shirt Sizing resource requirements** outlined in the master repository [README.md](../README.md#L112-L172) (Inference Gateway Servers) and [gemma-client/README.md](../README.md#L46-L73) (Multi-User Chat Application). 
 
 Both resource matrices have been audited against:
 1.  **VRAM Footprint Limits**: Model weights FP16 allocations and Key-Value (KV) Cache expansion margins.
@@ -115,7 +115,7 @@ $$\text{Max Single-Stream Decode} = \frac{\text{Memory Bandwidth (Bytes/Sec)}}{\
 
 ## 3. Client Application Validation: Concurrency & HA Pools
 
-The [Gemma Client chatbot application](file:///Users/gmollison/GitHub/gdc_gemma_gw/gemma-client/README.md) is stateless. Computations and network proxies scale horizontally in GKE standard node pools, while states persist under GDC-managed PostgreSQL instances.
+The [Gemma Client chatbot application](../README.md) is stateless. Computations and network proxies scale horizontally in GKE standard node pools, while states persist under GDC-managed PostgreSQL instances.
 
 ### 3.1. Client Node Pools Scaling Matrix (vCPUs & RAM)
 The client containers are extremely lightweight. In standard environments:

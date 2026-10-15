@@ -337,3 +337,23 @@ kubectl exec -it deployment/gemma-gateway -n gemma-inference -- python3 -c \
 kubectl exec -it deployment/gemma-gateway -n gemma-inference -- python3 -c \
   "import urllib.request; print(urllib.request.urlopen('http://vllm-26b-service:8000/v1/models').read().decode())"
 ```
+
+---
+
+## 7. Gemma Client Workload Identity & Database Troubleshooting
+
+### 1. `"serviceaccounts 'gemma-client-sa' not found"` During GCP IAM Binding
+If `gcloud iam service-accounts add-iam-policy-binding` returns `serviceaccounts "gemma-client-sa" not found`, create the Kubernetes Service Account in the target namespace first:
+```bash
+kubectl create serviceaccount gemma-client-sa -n "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+gcloud iam service-accounts add-iam-policy-binding "gemma-client-sa@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:${PROJECT_ID}.svc.id.goog[${NAMESPACE}/gemma-client-sa]"
+```
+
+### 2. PostgreSQL `"relation 'chats' does not exist"`
+If the `gemma-client` backend logs report missing database tables, re-seed the database schema (`test-data/seed_readiness_db.sql`):
+```bash
+PG_POD=$(kubectl get pod -n "${NAMESPACE}" -l app=postgres -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -i -n "${NAMESPACE}" "${PG_POD}" -- psql -U gemma_user -d gemma_db < test-data/seed_readiness_db.sql
+```

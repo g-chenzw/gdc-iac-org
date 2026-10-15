@@ -4,7 +4,7 @@
 
 This guide explains how to package the Gemma 4 Inference Gateway assets from an internet-connected bastion (like a Google Cloud Workstation) and transfer them to the GDC air-gapped (GDC-ag) environment using the GDC blueprint standard format.
 
-> For detailed instructions on provisioning multi-GPU nodes, configuring Helm parameters, and scaling vLLM workloads, refer to the [GDC Production Serving Guide: vLLM & Gemma 4](vllm-serving-guide.md).
+> For detailed instructions on provisioning multi-GPU nodes, configuring Helm parameters, and scaling vLLM workloads, refer to the [GDC Production Serving Guide: vLLM & Gemma 4](./vllm-serving-guide.md).
 
 ---
 
@@ -14,7 +14,7 @@ Deploying the full **Gemma 4 Dedicated Inference Gateway** stack in production G
 
 > [!TIP]
 > **GCP Staging & Sandbox Emulation Note:**
-> If you are testing or validating this entire setup inside a GCP GKE development sandbox rather than a live air-gapped GDC production rack, refer to the **[GCP Quickstart Guide](quickstart_on_GCP.md)**. The guide contains the exact commands to provision the GKE GPU cluster, configure symmetrical node labels (`app=vllm-26b`, `app=vllm-31b`, `app=client`), and deploy PostgreSQL database emulation (`statefulset-postgres.yaml`).
+> If you are testing or validating this entire setup inside a GCP GKE development sandbox rather than a live air-gapped GDC production rack, refer to the **[GCP Quickstart Guide](../tutorials/quickstart_on_GCP.md)**. The guide contains the exact commands to provision the GKE GPU cluster, configure symmetrical node labels (`app=vllm-26b`, `app=vllm-31b`, `app=client`), and deploy PostgreSQL database emulation (`statefulset-postgres.yaml`).
 
 ### 1. Target GDC Shared Platform/System Cluster
 * **Why?** GPU hardware cores (NVIDIA H100/A100) are the most restricted resource inside air-gapped environments. Deploying dynamic model engines inside individual Tenant/User clusters strands valuable GPU memory and causes cold-starts.
@@ -272,7 +272,7 @@ tar -xzf gateway/ollama/gemma-gateway-gdc-manifests.tar.gz
 ```
 
 #### Pathway B: Launching vLLM (GDC Production Dual-Model serving on NVIDIA H200 141GB):
-Extract the manifests bundle, initialize the namespace, and deploy the dual serving blueprints concurrently. We enforce GDC SAN dynamic persistent volumes (`standard-rwx`), local model paths (`/models/gemma-4-*`), 32768 context length on 141GB H200 GPUs, 96Gi host memory limits, and bare-metal GPU node pool selectors (`cloud.google.com/gke-accelerator: null`) by passing `-f blueprints/vllm-gke/values-gdc.yaml` (see [Section 3.3 of the vLLM Serving Guide](vllm-serving-guide.md#33-pre-deployment-production-adaptations--deploying-via-helm-nvidia-h200-141gb) for the complete pre-deployment production checklist):
+Extract the manifests bundle, initialize the namespace, and deploy the dual serving blueprints concurrently. We enforce GDC SAN dynamic persistent volumes (`standard-rwx`), local model paths (`/models/gemma-4-*`), 32768 context length on 141GB H200 GPUs, 96Gi host memory limits, and bare-metal GPU node pool selectors (`cloud.google.com/gke-accelerator: null`) by passing `-f blueprints/vllm-gke/values-gdc.yaml` (see [Section 3.3 of the vLLM Serving Guide](./vllm-serving-guide.md#33-pre-deployment-production-adaptations--deploying-via-helm-nvidia-h200-141gb) for the complete pre-deployment production checklist):
 
 ```bash
 tar -xzf gateway/vllm/gemma-gateway-gdc-manifests.tar.gz
@@ -320,7 +320,7 @@ export INFERENCE_ENGINE="vllm"
 
 Once deployed, verification cannot be done using normal web browsers or `port-forward`. You must test inside the cluster over internal DNS:
 
-1. Refer to the [Testing Methodology](testing-methodology.md) to start an ephemeral test client pod inside the `gemma-inference` namespace.
+1. Refer to the [Testing Methodology](../testing/testing-methodology.md) to start an ephemeral test client pod inside the `gemma-inference` namespace.
 2. Use `curl` to test gateway parameters and trigger inference calls directly against `http://gemma-gateway.gemma-inference.svc.cluster.local/v1/chat/completions`.
 
 ---
@@ -424,7 +424,7 @@ In production air-gapped environments, cross-project gateway access must be cryp
 
 *   **Keycloak Integration**: To secure user sessions, transition client applications from "Mock User" modes to federated OpenID Connect (OIDC) authentication using Keycloak running natively on GDC.
 *   **Architecture & Claims Validation**: The client frontend triggers the OIDC Authorization Code Flow (with PKCE) directly against Keycloak, obtaining a JWT (Access Token) which is dynamically attached as an `Authorization: Bearer <JWT>` header to downstream requests. The FastAPI backend cryptographically validates this signature using the Keycloak certificates (`/certs`).
-*   **Detailed Implementation Guide**: Refer to the complete, step-by-step [Keycloak Integration Guide](keycloak_integration_guide.md) for instructions on provisioning Keycloak Realms, configuring clients (`rag-frontend`), updating Axios token interceptors in React, and building robust OIDC validation middleware in python/FastAPI.
+*   **Detailed Implementation Guide**: Refer to the complete, step-by-step [Keycloak Integration Guide](./keycloak_integration_guide.md) for instructions on provisioning Keycloak Realms, configuring clients (`rag-frontend`), updating Axios token interceptors in React, and building robust OIDC validation middleware in python/FastAPI.
 
 
 
