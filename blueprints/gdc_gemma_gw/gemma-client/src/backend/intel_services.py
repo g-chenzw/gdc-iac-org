@@ -46,8 +46,37 @@ def is_safe_sql(query: str) -> bool:
             return False
     return True
 
+
+def has_destructive_sql_intent(user_query: str) -> bool:
+    forbidden_patterns = [
+        r"\bDROP\s+(TABLE|DATABASE|SCHEMA|VIEW|INDEX)\b",
+        r"\bTRUNCATE\s+(TABLE\s+)?\w+",
+        r"\bDELETE\s+FROM\b",
+        r"\bALTER\s+TABLE\b",
+        r"\bUPDATE\s+\w+\s+SET\b",
+        r"\bINSERT\s+INTO\b",
+        r"\b(GRANT|REVOKE)\s+",
+    ]
+    for pat in forbidden_patterns:
+        if re.search(pat, user_query or "", re.IGNORECASE):
+            return True
+    return False
+
+
 async def execute_analyst_query(user_query: str, user_id: str = "analyst") -> dict:
     start_time = time.time()
+
+    if has_destructive_sql_intent(user_query):
+        return {
+            "query": user_query,
+            "generated_sql": "-- Rejected by Security Gate",
+            "results": [],
+            "summary": "Security Alert: Destructive DDL/DML command rejected by read-only Security Gate.",
+            "row_count": 0,
+            "execution_time_ms": 0.0,
+            "total_latency_seconds": round(time.time() - start_time, 1),
+            "model_used": "security-gate",
+        }
     
     # 1. Ask model to generate SQL query
     prompt_messages = [

@@ -2,7 +2,7 @@
 
 > **Document ID:** `GUIDE-GDC-AI-BLUEPRINT-E2E-IAC`  
 > **Target Environment:** Google Distributed Cloud Air-Gapped (**GDC-ag**) Production Organization  
-> **Companion Staging Guide:** [AI-Enabled Blueprint E2E Test Guide (GCP Staging & Development)](./ai_enabled_e2e_gcp_staging_guide.md)  
+> **Companion Playbook:** [GUI Functional Walkthrough & Live Demo Playbook](./gui_demo_walkthrough_and_prompts.md)  
 > **Orchestration Framework:** `gdc-iac-org` Multi-Stage Helmfile Foundations (`0-bootstrap` $\rightarrow$ `5-workload-factory`)  
 > **Integrated Blueprints:**  
 > - **Stage 2 Zonal Managed Infrastructure:** GDC Managed Harbor (`charts/gdc-harbors`), Zonal HA PostgreSQL + `pgvector` (`charts/gdc-dbs`), and GDC Native Object Storage Buckets (`charts/gdc-buckets`)  
@@ -477,55 +477,33 @@ kubectl get gateway -n gemma-inference
 kubectl get gateway -n gdc-dev
 ```
 
-### 7.2. Verify OIDC-Authenticated Tiered Routing & Per-User Token Rate Limiting
+### 7.2. Automated 20-Check IO / AO Upgrade & Functional Verification Suite (`scripts/verify-e2e-gdc-ag.py`)
+
+Infrastructure Operators (**IOs**) and Application Operators (**AOs**) can execute `scripts/verify-e2e-gdc-ag.py` (100% Python 3 standard library; zero third-party packages required) before and after GDC-ag platform upgrades or Helmfile rollouts to validate all 20 infrastructure, zero-trust OIDC, Envoy `InferencePool` routing, Kafka, pgvector RAG, Agentic SQL, GDC Object Storage, and `gdc-dev` Swarm checks with `[PASS]` / `[FAIL]` flags:
 
 ```bash
-export GATEWAY_HOST="https://ai-gateway.gdc.local"
+cd ~/GitHub/gdc-iac-org
+chmod +x scripts/verify-e2e-gdc-ag.py
 
-python3 -c '
-import urllib.request, http.cookiejar, json, ssl
+# Option A: Run full 20-check IO + AO suite against GDC-ag production FQDNs
+./scripts/verify-e2e-gdc-ag.py --insecure --json-report /tmp/gdc-ag-upgrade-report.json
 
-ctx = ssl.create_default_context()
-cj = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(
-    urllib.request.HTTPSHandler(context=ctx),
-    urllib.request.HTTPCookieProcessor(cj)
-)
+# Option B: Run only Infrastructure Operator (IO) checks or only Application Operator (AO) checks
+./scripts/verify-e2e-gdc-ag.py --persona io
+./scripts/verify-e2e-gdc-ag.py --persona ao --insecure
 
-# 1. Authenticate via Keycloak OIDC (/login/oidc)
-login_req = urllib.request.Request(
-    "https://ai-gateway.gdc.local/login/oidc",
-    data=json.dumps({"username": "charlie", "password": "password", "role": "admin"}).encode("utf-8"),
-    headers={"Content-Type": "application/json"}
-)
-with opener.open(login_req, timeout=15) as r:
-    print("OIDC Auth:", r.status, json.loads(r.read().decode("utf-8")))
-
-# 2. Verify Tier 1 (26B MoE) & Tier 2 (31B Dense) routing via Envoy InferencePool
-for label, prompt in [
-    ("Tier 1 (26B MoE)", "Give a one-sentence summary of Google Distributed Cloud."),
-    ("Tier 2 (31B Dense)", "Write a Python function to compute Fibonacci numbers.")
-]:
-    req = urllib.request.Request(
-        "https://ai-gateway.gdc.local/v1/chat/completions",
-        data=json.dumps({
-            "model": "gemma4",
-            "max_tokens": 128,
-            "messages": [{"role": "user", "content": prompt}]
-        }).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
-    )
-    with opener.open(req, timeout=60) as resp:
-        model_used = resp.headers.get("X-Model-Used")
-        model_tier = resp.headers.get("X-Model-Tier")
-        print(f"\n[{label}] Status: {resp.status} | X-Model-Used: {model_used} | X-Model-Tier: {model_tier}")
-'
+# Option C: Run against local Operator Workstation port-forwards (Ports 8080-8084)
+./scripts/verify-e2e-gdc-ag.py --port-forward --json-report /tmp/gdc-ag-upgrade-report.json
 
 # Inspect filtered gateway + epp routing logs
 kubectl logs -n gemma-inference deploy/gemma-gateway --tail=200 | grep -E "Classifier|Routing|envoy-inference-pool|completions"
 ```
 
 ### 7.3. Interactive Browser Verification Matrix Across All Production Endpoints
+
+> [!TIP]
+> **Full Demo Script & Copy-Paste Prompts:**  
+> For a complete click-by-click walkthrough with copy-pasteable prompts, sample RAG upload files, and expected UI badges for live demonstrations, see [GUI Functional Walkthrough & Live Demo Playbook](./gui_demo_walkthrough_and_prompts.md).
 
 1. **`https://ai-gateway.gdc.local` (or Port `8080` — `🧠 Gemma 4 Gateway Control Plane`)**:
    * **OIDC Authentication Bar (Top Strip)**: Click **`🔑 Keycloak SSO Login (/auth)`** (`charlie` / `password`) or **`🛡️ One-Click Admin (charlie)`** to sign in (`Role: ADMIN`).
