@@ -589,7 +589,8 @@ def main() -> int:
         if s_blk != 200:
             raise RuntimeError(f"GET /api/users/blocked returned HTTP {s_blk}")
         blk_data = json.loads(b_blk.decode("utf-8"))
-        if target not in blk_data.get("blocked_users", []):
+        blocked_list = blk_data if isinstance(blk_data, list) else blk_data.get("blocked_users", blk_data.get("blocklist", []))
+        if target not in blocked_list:
             raise RuntimeError(f"User {target} missing from /api/users/blocked")
         s2, _, _ = runner.request(
             f"{args.gateway_url}/api/users/{target}/block",
@@ -620,18 +621,31 @@ def main() -> int:
                     ["kubectl", "rollout", "status", "deployment/gdc-gateway-tunnel", "-n", args.namespace, "--timeout=60s"],
                     capture_output=True, text=True, timeout=65
                 )
+                subprocess.run(["pkill", "-f", "port-forward.*gdc-gateway-tunnel"], capture_output=True)
                 time.sleep(3)
 
         for label, base_url in [("Gateway API", args.client_gw_url), ("Ingress", args.client_ingress_url)]:
-            s_ui, _, _ = runner.request(f"{base_url}/", timeout=15)
-            if s_ui != 200:
-                raise RuntimeError(f"{label} ({base_url}) root returned HTTP {s_ui}")
-            s_h, _, _ = runner.request(f"{base_url}/api/health", timeout=15)
-            if s_h != 200:
-                raise RuntimeError(f"{label} ({base_url}/api/health) returned HTTP {s_h}")
-            s_m, _, b_m = runner.request(f"{base_url}/api/models", timeout=15)
-            if s_m != 200 or not json.loads(b_m.decode("utf-8")):
-                raise RuntimeError(f"{label} ({base_url}/api/models) failed")
+            last_err = ""
+            for _attempt in range(5):
+                s_ui, _, _ = runner.request(f"{base_url}/", timeout=15)
+                if s_ui != 200:
+                    last_err = f"{label} ({base_url}) root returned HTTP {s_ui}"
+                    time.sleep(1.5)
+                    continue
+                s_h, _, _ = runner.request(f"{base_url}/api/health", timeout=15)
+                if s_h != 200:
+                    last_err = f"{label} ({base_url}/api/health) returned HTTP {s_h}"
+                    time.sleep(1.5)
+                    continue
+                s_m, _, b_m = runner.request(f"{base_url}/api/models", timeout=15)
+                if s_m != 200 or not json.loads(b_m.decode("utf-8")):
+                    last_err = f"{label} ({base_url}/api/models) returned HTTP {s_m}"
+                    time.sleep(1.5)
+                    continue
+                last_err = ""
+                break
+            if last_err:
+                raise RuntimeError(last_err)
         runner.active_client_url = args.client_gw_url
         return "Both Gateway API and Ingress endpoints healthy & serving models"
 
@@ -862,11 +876,17 @@ def main() -> int:
         ide_msg = ""
         if s_ide_bc == 200:
             try:
-                ide_msg = json.loads(b_ide_bc.decode("utf-8")).get("message", "")
+                bc_obj = json.loads(b_ide_bc.decode("utf-8"))
+                if isinstance(bc_obj.get("broadcast"), dict):
+                    ide_msg = bc_obj["broadcast"].get("message", "")
+                elif isinstance(bc_obj.get("banner"), dict):
+                    ide_msg = bc_obj["banner"].get("message", "")
+                else:
+                    ide_msg = str(bc_obj.get("message") or bc_obj.get("broadcast") or "")
             except Exception:
                 ide_msg = b_ide_bc.decode("utf-8", "ignore")
         if s_ide_bc != 200 or (banner_msg not in ide_msg and "GDC-ag Upgrade Validation" not in ide_msg):
-            raise RuntimeError("Broadcast banner did not propagate to Developer IDE")
+            raise RuntimeError(f"Broadcast banner did not propagate to Developer IDE (got: {ide_msg})")
 
         runner.request(
             f"{args.dev_admin_url}/admin/system/broadcast",
