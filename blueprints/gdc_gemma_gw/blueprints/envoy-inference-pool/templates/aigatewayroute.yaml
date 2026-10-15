@@ -90,8 +90,8 @@ spec:
       kind: Gateway
       group: gateway.networking.k8s.io
   rateLimit:
-    type: Global
-    global:
+    type: Local
+    local:
       rules:
         - clientSelectors:
             - headers:
@@ -109,64 +109,5 @@ spec:
               metadata:
                 namespace: {{ .Values.tokenRateLimit.costMetadataNamespace | default "io.envoy.ai_gateway" }}
                 key: {{ .Values.tokenRateLimit.costMetadataKey | default "llm_total_tokens" }}
-{{- if .Values.tokenRateLimit.deployRedis }}
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ .Values.gateway.name | default "gemma-envoy-inference-pool" }}-redis
-  namespace: {{ $ns }}
-  labels:
-    app: {{ .Values.gateway.name | default "gemma-envoy-inference-pool" }}-redis
-    {{- $labels | nindent 4 }}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: {{ .Values.gateway.name | default "gemma-envoy-inference-pool" }}-redis
-  template:
-    metadata:
-      labels:
-        app: {{ .Values.gateway.name | default "gemma-envoy-inference-pool" }}-redis
-        {{- $labels | nindent 8 }}
-    spec:
-      {{- with .Values.global.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 999
-      containers:
-        - name: redis
-          image: {{ include "envoy-inference-pool.redisImage" . | quote }}
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: redis
-              containerPort: {{ .Values.tokenRateLimit.redis.port | default 6379 }}
-          resources:
-            requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              cpu: "500m"
-              memory: "512Mi"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis
-  namespace: {{ $ns }}
-  labels:
-    {{- $labels | nindent 4 }}
-spec:
-  type: ClusterIP
-  selector:
-    app: {{ .Values.gateway.name | default "gemma-envoy-inference-pool" }}-redis
-  ports:
-    - name: redis
-      port: {{ .Values.tokenRateLimit.redis.port | default 6379 }}
-      targetPort: {{ .Values.tokenRateLimit.redis.port | default 6379 }}
-{{- end }}
 {{- end }}
 {{- end }}

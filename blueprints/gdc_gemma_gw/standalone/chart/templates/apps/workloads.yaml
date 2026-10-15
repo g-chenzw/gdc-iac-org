@@ -70,8 +70,6 @@ spec:
           value: {{ .Values.apps.adminRequireOidc | default (.Values.apps.enableOidc | default true) | quote }}
         - name: KEYCLOAK_URL
           value: {{ .Values.apps.keycloakUrl | default "http://keycloak-svc:8080/auth/realms/gdc-rag-realm" | quote }}
-        - name: REDIS_URL
-          value: {{ .Values.apps.redisUrl | default "" | quote }}
         - name: GATEWAY_STATE_FILE
           value: {{ .Values.apps.gatewayStateFile | default "/tmp/gemma_gateway_state.json" | quote }}
         {{- $rawEnvoyUrl := "" }}

@@ -48,8 +48,6 @@ spec:
           value: "http://keycloak-svc:8080/auth/realms/gdc-rag-realm"
         - name: OIDC_CLIENT_ID
           value: "rag-frontend"
-        - name: REDIS_URL
-          value: ""
         - name: GATEWAY_STATE_FILE
           value: "/tmp/gemma_gateway_state.json"
         resources:

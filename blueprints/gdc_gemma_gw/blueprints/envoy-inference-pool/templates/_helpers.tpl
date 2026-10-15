@@ -21,16 +21,6 @@
 {{- end -}}
 {{- end -}}
 
-{{- define "envoy-inference-pool.redisImage" -}}
-{{- $repo := .Values.tokenRateLimit.redis.image -}}
-{{- $reg := coalesce .Values.registry .Values.global.registry -}}
-{{- if $reg -}}
-{{- printf "%s/%s:%s" (trimSuffix "/" $reg) (base $repo) (.Values.tokenRateLimit.redis.tag | default "7.2-alpine") -}}
-{{- else -}}
-{{- printf "%s:%s" $repo (.Values.tokenRateLimit.redis.tag | default "7.2-alpine") -}}
-{{- end -}}
-{{- end -}}
-
 {{- define "envoy-inference-pool.labels" -}}
 app.kubernetes.io/name: {{ include "envoy-inference-pool.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}

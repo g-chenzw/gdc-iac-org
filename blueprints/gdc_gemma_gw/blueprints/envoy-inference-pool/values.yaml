@@ -104,8 +104,3 @@ tokenRateLimit:
   unit: "Hour"
   costMetadataNamespace: "io.envoy.ai_gateway"
   costMetadataKey: "llm_total_tokens"
-  deployRedis: false
-  redis:
-    image: "redis"
-    tag: "7.2-alpine"
-    port: 6379

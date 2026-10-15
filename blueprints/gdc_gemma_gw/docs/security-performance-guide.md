@@ -261,26 +261,19 @@ CURRENT_STATE = {
 
 **Impact:** In multi-replica deployments, each pod has independent state. Config updates on one pod are invisible to others. State is lost on restart.
 
-**Fix:** Use Redis for shared state:
+**Fix:** Persist gateway configuration, sessions, and blocklists to an atomic shared state file (`GATEWAY_STATE_FILE`) using `fcntl.flock` file locking (backed by a local path or shared `ReadWriteMany` PVC across replicas):
 ```python
-import redis.asyncio as aioredis
-
-redis_client = aioredis.from_url(
-    os.getenv("REDIS_URL", "redis://redis:6379/0"),
-    decode_responses=True
-)
+GATEWAY_STATE_FILE = os.getenv("GATEWAY_STATE_FILE", "/tmp/gemma_gateway_state.json")
 
 async def get_config():
-    state = await redis_client.hgetall("gateway:config")
-    return {**DEFAULT_STATE, **state}
+    sync_shared_state()
+    return CURRENT_STATE
 
 async def update_config(config: UpdateConfigRequest):
-    updates = {}
-    if config.temperature is not None: updates["temperature"] = str(config.temperature)
-    if config.top_p is not None: updates["top_p"] = str(config.top_p)
+    if config.temperature is not None: CURRENT_STATE["temperature"] = config.temperature
+    if config.top_p is not None: CURRENT_STATE["top_p"] = config.top_p
     # ... etc
-    if updates:
-        await redis_client.hset("gateway:config", mapping=updates)
+    persist_shared_state()
 ```
 
 ---
@@ -685,7 +678,7 @@ async def health():
 
 ### Phase 2 — Performance & Reliability
 
-- [ ] **P2-8:** Replace global state with Redis
+- [x] **P2-8:** Persist global state via atomic shared state file (`GATEWAY_STATE_FILE`)
 - [ ] **P2-9:** Configure OpenAI client connection pooling (using `AsyncOpenAI` and `httpx.AsyncClient`)
 - [ ] **P2-10:** Size database connection pool explicitly
 - [ ] **P2-11:** Make GCS operations async (using `asyncio.to_thread` to offload GCS blocking operations)

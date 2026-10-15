@@ -18,7 +18,7 @@ In a production **GDC-ag** environment, imperative `kubectl apply` and ad-hoc sh
 | `gdc-iac-org` IaC Principle | How This Production AI-Enabled E2E Guide Implements It |
 | :--- | :--- |
 | **1. No In-Tree Environment State** | Zero environment secrets or mutable cluster states are committed to Git. Environment parameters live strictly in `foundations/bases/environments/<env>/` (`globals.yaml`, `contexts.yaml`, `charts.yaml`, `zone1/tenant-1.yaml`), while credentials are injected via **HashiCorp Vault (`p11-vault`)** / Kubernetes Secrets managed in the `iac-root` and tenant namespaces. |
-| **2. Artifact Publishing & Turnkey Air-Gap OCI Mirroring** | All container images (including `epp:v1.3.0`, `redis:7.2-alpine`, `vllm-openai`, `gemma-proxy`, `gemma-client`, and `gdc-dev`) and Helm charts are verified via **SHA-256 BOM + Sigstore Cosign** and ingested into **GDC Managed Harbor** using `./scripts/ingest-airgap-bundle.sh` and `tools/mirror-images/mirror_images.py`. |
+| **2. Artifact Publishing & Turnkey Air-Gap OCI Mirroring** | All container images (including `epp:v1.3.0`, `vllm-openai`, `gemma-proxy`, `gemma-client`, and `gdc-dev`) and Helm charts are verified via **SHA-256 BOM + Sigstore Cosign** and ingested into **GDC Managed Harbor** using `./scripts/ingest-airgap-bundle.sh` and `tools/mirror-images/mirror_images.py`. |
 | **3. Strictly Layered 6-Stage Execution Order** | Respects GDC custom resource dependencies by executing sequentially across Global, Zonal, and User Cluster kubecontexts: `0-bootstrap` $\rightarrow$ `0-org-setup` $\rightarrow$ `1-project-factory` $\rightarrow$ `2-resources` $\rightarrow$ `3-clusters` $\rightarrow$ `5-workload-factory`. |
 | **4. Separation of Zonal Managed Services vs. User Cluster Workloads** | **Stage 2 (`2-resources`)** provisions Zonal GDC Custom Resources (`DBCluster`, `Bucket`, `HarborInstance`) on the Org Admin / Zone cluster, whereas **Stage 5 (`5-workload-factory`)** deploys application charts to the User/Shared Cluster with `deploy_gdc_resources: false` and `deploy_apps: true`. |
 | **5. 4-Layer Offline Pre-Flight Validation** | Before any `helmfile apply`, all charts pass `helm lint` + `values.schema.json`, `helm-unittest`, `kubeconform`, and `conftest` (`policy/security.rego`) via `./scripts/test-charts.sh` and `./foundations/scripts/validate.sh <env>`. |
@@ -43,7 +43,7 @@ flowchart LR
 
 | Functional Surface | GCP Staging Port-Forward | GDC-ag Production Hostname / Route | Production Data Plane & Telemetry Source |
 | :--- | :--- | :--- | :--- |
-| **Gemma 4 Gateway Control Plane & OpenAI API (`/v1`)** | **Port `8080`** (`svc/gemma-gateway`) | `https://ai-gateway.gdc.local` (`HTTPRoute` + `AIGatewayRoute` in `gemma-inference`) | **Gemma Gateway + Envoy `InferencePool` (`epp`).** Scrapes **live** vLLM Prometheus metrics (`vllm:num_requests_waiting`, `vllm:gpu_cache_usage_perc`), enforces Redis-backed per-user token budgets (`x-user-id`), and routes Tier 1 (`26B MoE`) vs. Tier 2 (`31B Dense`). |
+| **Gemma 4 Gateway Control Plane & OpenAI API (`/v1`)** | **Port `8080`** (`svc/gemma-gateway`) | `https://ai-gateway.gdc.local` (`HTTPRoute` + `AIGatewayRoute` in `gemma-inference`) | **Gemma Gateway + Envoy `InferencePool` (`epp`).** Scrapes **live** vLLM Prometheus metrics (`vllm:num_requests_waiting`, `vllm:gpu_cache_usage_perc`), enforces Envoy `BackendTrafficPolicy` per-user token budgets (`x-user-id`), and routes Tier 1 (`26B MoE`) vs. Tier 2 (`31B Dense`). |
 | **Joint Intelligence E2E Console + Chat Client (Gateway API Path)** | **Port `8081`** (`svc/gdc-gateway-tunnel`) | `https://intel.gdc.local` (`Gateway/gdc-platform-gateway` + `HTTPRoute/gemma-unified-routes`) | **Kubernetes Gateway API (`gateway.networking.k8s.io/v1`).** Primary GDC-ag hardware load balancer path terminating TLS via GDC Platform PKI (`cert-manager`) and routing `/`, `/api/`, `/v1/`, and `/auth/` on a single origin. |
 | **Joint Intelligence E2E Console + Chat Client (Ingress Path)** | **Port `8082`** (`svc/gemma-ingress-gateway`) | `https://intel-ingress.gdc.local` (GDC Internal LB `Ingress` with `networking.gdc.goog/internal-loadbalancer: "true"`) | **Kubernetes Ingress Controller.** Optional secondary ingress path exposing the exact same `gemma-client` service for organizations standardizing on `networking.k8s.io/v1` `Ingress`. |
 | **`gdc-dev` Sovereign Admin & Telemetry Console** | **Port `8083`** (`deploy/gdc-dev-landing-page:8081`) | `https://admin.dev.gdc.local` (Dedicated Admin `HTTPRoute` $\rightarrow$ `:8081` in `gdc-dev`) | **Port-Isolated Admin Listener (`:8081`).** **Hybrid Telemetry:** Seeds `5` baseline verification events at startup, then tracks **live** GDC block PVC storage (`/home/dev/workspace`), **live** IDE AI Swarm latencies/invocations, and session eviction/hibernation controls. |
@@ -73,7 +73,7 @@ cd ~/GitHub/gdc-iac-org
 # 1. Run the 4-layer offline chart validation suite (helm lint + schema, helm-unittest, kubeconform, OPA conftest)
 ./scripts/test-charts.sh
 
-# 2. Mirror all external container images (including vLLM, Envoy epp:v1.3.0, Redis, Kafka, Postgres, Keycloak)
+# 2. Mirror all external container images (including vLLM, Envoy epp:v1.3.0, Kafka, Postgres, Keycloak)
 python3 ./tools/mirror-images/mirror_images.py \
   --images-file ./blueprints/gdc_gemma_gw/bulk_external_images.txt \
   --save-dir ./packages/external-images
@@ -116,7 +116,7 @@ helm registry login "${HARBOR_REGISTRY}"
   --registry "${HARBOR_REGISTRY}" \
   --project "${HARBOR_PROJECT}"
 
-# 3. Push mirrored 3P images (vLLM, Envoy epp:v1.3.0, Redis, Kafka, Keycloak) into Harbor
+# 3. Push mirrored 3P images (vLLM, Envoy epp:v1.3.0, Kafka, Keycloak) into Harbor
 python3 ./tools/mirror-images/mirror_images.py \
   --load-dir ./packages/external-images \
   --registry "${HARBOR_REGISTRY}/${HARBOR_PROJECT}"
@@ -299,7 +299,6 @@ prd:
                     enabled: true
                     limit: 50000
                     unit: "Hour"
-                    deployRedis: true
 
               # 5. Gemma 4 Gateway Control Plane & Complexity Classifier
               - name: "gemma-gateway"

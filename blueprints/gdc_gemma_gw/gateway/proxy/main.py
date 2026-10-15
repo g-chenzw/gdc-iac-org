@@ -120,78 +120,15 @@ UNSUPPORTED_SYSTEM_ROLE_MODELS: Set[str] = set()
 
 
 # =====================================================================
-# Shared Multi-Replica State Persistence (Redis RESP2 / Atomic File Store)
+# Shared Multi-Replica State Persistence (Atomic File Store)
 # =====================================================================
-REDIS_URL = os.getenv("REDIS_URL", "")
 GATEWAY_STATE_FILE = os.getenv("GATEWAY_STATE_FILE", "")
-_REDIS_STATE_KEY = os.getenv("GATEWAY_STATE_KEY", "gdc:gemma_gateway:state")
-
-
-def _parse_redis_url(url: str) -> Optional[Tuple[str, int, Optional[str]]]:
-    """Parses redis://[:password@]host[:port][/db] without requiring third-party libraries."""
-    if not url or not url.startswith("redis://"):
-        return None
-    stripped = url[len("redis://") :].split("/", 1)[0]
-    password = None
-    if "@" in stripped:
-        auth_part, host_part = stripped.rsplit("@", 1)
-        password = auth_part.split(":", 1)[1] if ":" in auth_part else auth_part
-    else:
-        host_part = stripped
-    if ":" in host_part:
-        host, port_str = host_part.rsplit(":", 1)
-        return host, int(port_str), password
-    return host_part, 6379, password
-
-
-def _redis_resp_command(
-    host: str, port: int, args: List[str], password: Optional[str] = None
-) -> Optional[str]:
-    """Executes a minimal Redis RESP2 command over a short-lived socket."""
-    def _encode_cmd(parts: List[str]) -> bytes:
-        buf = [f"*{len(parts)}\r\n".encode("utf-8")]
-        for part in parts:
-            encoded = part.encode("utf-8")
-            buf.append(f"${len(encoded)}\r\n".encode("utf-8") + encoded + b"\r\n")
-        return b"".join(buf)
-
-    def _read_resp(sock_file) -> Optional[str]:
-        line = sock_file.readline()
-        if not line:
-            return None
-        prefix = chr(line[0])
-        payload = line[1:].rstrip(b"\r\n")
-        if prefix == "+":
-            return payload.decode("utf-8", errors="replace")
-        if prefix == "-":
-            raise RuntimeError(payload.decode("utf-8", errors="replace"))
-        if prefix == ":":
-            return payload.decode("utf-8", errors="replace")
-        if prefix == "$":
-            length = int(payload)
-            if length < 0:
-                return None
-            data = sock_file.read(length)
-            sock_file.read(2)  # trailing CRLF
-            return data.decode("utf-8", errors="replace")
-        return None
-
-    with socket.create_connection((host, port), timeout=1.5) as sock:
-        with sock.makefile("rwb") as sock_file:
-            if password:
-                sock_file.write(_encode_cmd(["AUTH", password]))
-                sock_file.flush()
-                _read_resp(sock_file)
-            sock_file.write(_encode_cmd(args))
-            sock_file.flush()
-            return _read_resp(sock_file)
 
 
 def persist_shared_state() -> None:
-    """Persists gateway configuration, sessions, and blocklists to Redis or an atomic state file."""
-    redis_url = os.getenv("REDIS_URL", REDIS_URL)
+    """Persists gateway configuration, sessions, and blocklists to an atomic state file."""
     state_file = os.getenv("GATEWAY_STATE_FILE", GATEWAY_STATE_FILE)
-    if not redis_url and not state_file:
+    if not state_file:
         return
 
     snapshot = {
@@ -202,68 +139,43 @@ def persist_shared_state() -> None:
     }
     serialized = json.dumps(snapshot)
 
-    if redis_url:
-        parsed = _parse_redis_url(redis_url)
-        if parsed:
-            host, port, password = parsed
+    try:
+        parent_dir = os.path.dirname(os.path.abspath(state_file))
+        os.makedirs(parent_dir, exist_ok=True)
+        lock_path = f"{state_file}.lock"
+        with open(lock_path, "w", encoding="utf-8") as lock_fp:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
             try:
-                _redis_resp_command(
-                    host, port, ["SET", _REDIS_STATE_KEY, serialized], password=password
-                )
-            except Exception as e:
-                logger.warning(f"Failed to persist gateway state to Redis ({host}:{port}): {e}")
-
-    if state_file:
-        try:
-            parent_dir = os.path.dirname(os.path.abspath(state_file))
-            os.makedirs(parent_dir, exist_ok=True)
-            lock_path = f"{state_file}.lock"
-            with open(lock_path, "w", encoding="utf-8") as lock_fp:
-                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
-                try:
-                    fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix=".gw_state_")
-                    with os.fdopen(fd, "w", encoding="utf-8") as tmp_fp:
-                        tmp_fp.write(serialized)
-                        tmp_fp.flush()
-                        os.fsync(tmp_fp.fileno())
-                    os.replace(tmp_path, state_file)
-                finally:
-                    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
-        except Exception as e:
-            logger.warning(f"Failed to persist gateway state to file ({state_file}): {e}")
+                fd, tmp_path = tempfile.mkstemp(dir=parent_dir, prefix=".gw_state_")
+                with os.fdopen(fd, "w", encoding="utf-8") as tmp_fp:
+                    tmp_fp.write(serialized)
+                    tmp_fp.flush()
+                    os.fsync(tmp_fp.fileno())
+                os.replace(tmp_path, state_file)
+            finally:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        logger.warning(f"Failed to persist gateway state to file ({state_file}): {e}")
 
 
 def sync_shared_state() -> None:
-    """Synchronizes in-memory state from Redis or the shared state file when configured."""
-    redis_url = os.getenv("REDIS_URL", REDIS_URL)
+    """Synchronizes in-memory state from the shared state file when configured."""
     state_file = os.getenv("GATEWAY_STATE_FILE", GATEWAY_STATE_FILE)
-    if not redis_url and not state_file:
+    if not state_file or not os.path.exists(state_file):
         return
 
     raw_json: Optional[str] = None
-    if redis_url:
-        parsed = _parse_redis_url(redis_url)
-        if parsed:
-            host, port, password = parsed
+    try:
+        lock_path = f"{state_file}.lock"
+        with open(lock_path, "w", encoding="utf-8") as lock_fp:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_SH)
             try:
-                raw_json = _redis_resp_command(
-                    host, port, ["GET", _REDIS_STATE_KEY], password=password
-                )
-            except Exception as e:
-                logger.warning(f"Failed to read gateway state from Redis ({host}:{port}): {e}")
-
-    if raw_json is None and state_file and os.path.exists(state_file):
-        try:
-            lock_path = f"{state_file}.lock"
-            with open(lock_path, "w", encoding="utf-8") as lock_fp:
-                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_SH)
-                try:
-                    with open(state_file, "r", encoding="utf-8") as fp:
-                        raw_json = fp.read()
-                finally:
-                    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
-        except Exception as e:
-            logger.warning(f"Failed to read gateway state from file ({state_file}): {e}")
+                with open(state_file, "r", encoding="utf-8") as fp:
+                    raw_json = fp.read()
+            finally:
+                fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        logger.warning(f"Failed to read gateway state from file ({state_file}): {e}")
 
     if not raw_json:
         return
